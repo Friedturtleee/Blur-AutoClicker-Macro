@@ -135,6 +135,9 @@ impl RunControl {
 
 pub fn start_clicker_inner(app: &AppHandle) -> AppResult<ClickerStatusPayload> {
     let state = app.state::<ClickerState>();
+    if state.recording_active.load(Ordering::SeqCst) {
+        return Err(AppError::AlreadyRunning);
+    }
     if state.running.load(Ordering::SeqCst) {
         return Err(AppError::AlreadyRunning);
     }
@@ -179,6 +182,11 @@ pub fn start_clicker_inner(app: &AppHandle) -> AppResult<ClickerStatusPayload> {
     {
         return Err(AppError::AlreadyRunning);
     }
+    if state.recording_active.load(Ordering::SeqCst) {
+        state.running.store(false, Ordering::SeqCst);
+        return Err(AppError::AlreadyRunning);
+    }
+    state.active_job_is_macro.store(false, Ordering::SeqCst);
 
     {
         *state.last_error.lock().unwrap_or_else(poisoned_inner) = None;
@@ -240,6 +248,7 @@ pub fn stop_clicker_inner(
 ) -> AppResult<ClickerStatusPayload> {
     let state = app.state::<ClickerState>();
     let was_running = state.running.swap(false, Ordering::SeqCst);
+    let was_macro = state.active_job_is_macro.swap(false, Ordering::SeqCst);
     state.active_click_point_index.store(-1, Ordering::SeqCst);
     state.active_click_point_tick.store(0, Ordering::SeqCst);
     state.zone_started_clicker.store(false, Ordering::SeqCst);
@@ -247,7 +256,7 @@ pub fn stop_clicker_inner(
     if was_running {
         state.run_generation.fetch_add(1, Ordering::SeqCst);
     }
-    if let Some(reason) = stop_reason {
+    if let Some(reason) = stop_reason.clone() {
         if was_running {
             *state.stop_reason.lock().unwrap_or_else(poisoned_inner) = Some(reason);
         }
@@ -256,6 +265,13 @@ pub fn stop_clicker_inner(
     let payload = current_status(app);
     if was_running {
         crate::icon::set_app_icons(app);
+        if was_macro {
+            use tauri::Emitter;
+            let _ = app.emit(
+                "macro:state",
+                serde_json::json!({ "state": "Cancelled", "reason": stop_reason }),
+            );
+        }
     }
     emit_status(app);
     Ok(payload)
@@ -482,6 +498,23 @@ pub fn toggle_clicker_inner(app: &AppHandle) -> AppResult<ClickerStatusPayload> 
     let state = app.state::<ClickerState>();
     if state.running.load(Ordering::SeqCst) {
         stop_clicker_inner(app, Some(String::from("Stopped from hotkey")))
+    } else if state
+        .macro_mode_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        crate::macro_engine::start_macro_inner(app)
+    } else {
+        start_clicker_inner(app)
+    }
+}
+
+pub fn start_selected_job_inner(app: &AppHandle) -> AppResult<ClickerStatusPayload> {
+    let state = app.state::<ClickerState>();
+    if state
+        .macro_mode_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        crate::macro_engine::start_macro_inner(app)
     } else {
         start_clicker_inner(app)
     }

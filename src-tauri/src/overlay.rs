@@ -227,6 +227,37 @@ pub fn show_click_point_pick_overlay(app: &AppHandle) -> AppResult<()> {
     Ok(())
 }
 
+pub fn show_macro_coordinate_pick_overlay(app: &AppHandle) -> AppResult<()> {
+    let window = app
+        .get_webview_window("overlay")
+        .ok_or_else(|| AppError::OverlayNotFound)?;
+    let bounds = current_virtual_screen_rect()
+        .ok_or_else(|| AppError::State("Virtual screen bounds not available".into()))?;
+
+    #[cfg(target_os = "windows")]
+    {
+        sync_overlay_bounds(&window)?;
+        show_overlay_window(&window)?;
+    }
+
+    CLICK_POINT_PICK_OVERLAY_ACTIVE.store(true, Ordering::SeqCst);
+    emit_click_points(&window, bounds, &[], true);
+    set_click_point_pick_mode(app, true)?;
+
+    if let Some((x, y)) = current_cursor_position() {
+        let offset = VirtualScreenRect::new(x, y, 1, 1).offset_from(bounds);
+        let _ = window.emit(
+            "click-pick-cursor",
+            serde_json::json!({
+                "x": offset.left,
+                "y": offset.top,
+            }),
+        );
+    }
+
+    Ok(())
+}
+
 pub fn set_click_point_pick_mode(app: &AppHandle, active: bool) -> AppResult<()> {
     CLICK_POINT_PICK_OVERLAY_ACTIVE.store(active, Ordering::SeqCst);
     if let Some(window) = app.get_webview_window("overlay") {

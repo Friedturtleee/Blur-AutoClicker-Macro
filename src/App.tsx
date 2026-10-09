@@ -43,6 +43,7 @@ import {
 } from "./settingsSchema";
 import { save, open } from "@tauri-apps/plugin-dialog";
 import { writeTextFile, readTextFile } from "@tauri-apps/plugin-fs";
+import { migrateLegacyMacroProfiles } from "./macro/migration";
 import {
   APP_VERSION,
   DEFAULT_SETTINGS,
@@ -65,14 +66,12 @@ const ZonesPanel = lazy(() => import("./components/panels/zones/ZonesPanel"));
 const SettingsPanel = lazy(
   () => import("./components/panels/settings/SettingsPanel"),
 );
-const ClickPointsPanel = lazy(
-  () => import("./components/panels/click-points/ClickPointsPanel"),
-);
+const MacroPanel = lazy(() => import("./components/panels/macro/MacroPanel"));
 const TitleBar = lazy(() => import("./components/TitleBar"));
 const StatusBar = lazy(() => import("./components/StatusBar"));
 export type Tab = "simple" | "advanced" | "zones" | "settings" | "click-points";
 
-const BACKEND_SETTINGS_SCHEMA_VERSION = 10;
+const BACKEND_SETTINGS_SCHEMA_VERSION = 11;
 const MAX_DROPDOWN_OVERFLOW_BOTTOM = 220;
 const STATUS_BAR_HEIGHT = 26;
 
@@ -88,7 +87,7 @@ function getPanelSize(tab: Tab, hasUpdate: boolean) {
   }
   if (tab === "settings") return { width: 700, height: 720 + extra };
   if (tab === "zones") return { width: 700, height: 700 + extra };
-  if (tab === "click-points") return { width: 550, height: 600 + extra };
+  if (tab === "click-points") return { width: 820, height: 720 + extra };
   return { width: 900, height: 469 + extra };
 }
 
@@ -137,9 +136,17 @@ const DEFAULT_APP_INFO: AppInfo = {
 };
 
 async function syncSettingsToBackend(settings: Settings) {
+  const backendSettings = Object.fromEntries(
+    Object.entries(settings).filter(
+      ([key]) =>
+        key !== "macroProfiles" &&
+        key !== "activeMacroId" &&
+        key !== "macroMigrationVersion",
+    ),
+  );
   await invoke("update_settings", {
     settings: {
-      ...settings,
+      ...backendSettings,
       version: BACKEND_SETTINGS_SCHEMA_VERSION,
     },
   });
@@ -190,6 +197,11 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("simple");
   const [settings, setSettings] = useState<Settings>(DEFAULT_SETTINGS);
   const [settingsLoaded, setSettingsLoaded] = useState(false);
+  const [macroDirty, setMacroDirty] = useState(false);
+  const activeMacro =
+    settings.macroProfiles.find(
+      (profile) => profile.id === settings.activeMacroId,
+    ) ?? settings.macroProfiles[0];
   const [status, setStatus] = useState<ClickerStatus>(DEFAULT_STATUS);
   const [appInfo, setAppInfo] = useState<AppInfo>(DEFAULT_APP_INFO);
   const [updateInfo, setUpdateInfo] = useState<{
@@ -412,14 +424,37 @@ export default function App() {
     }
 
     const nextPresets = [...committedSettingsRef.current.presets, preset];
+    const activeMacro = committedSettingsRef.current.macroProfiles.find(
+      (profile) => profile.id === committedSettingsRef.current.activeMacroId,
+    );
+    const nextMacroProfiles = activeMacro
+      ? [
+          ...committedSettingsRef.current.macroProfiles,
+          {
+            ...activeMacro,
+            id:
+              globalThis.crypto?.randomUUID?.() ??
+              "macro-" +
+                Date.now() +
+                "-" +
+                Math.random().toString(36).slice(2, 8),
+            name: (activeMacro.name + " (" + preset.name + ")").slice(0, 80),
+            sourcePresetId: preset.id,
+            createdAt: new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+          },
+        ]
+      : committedSettingsRef.current.macroProfiles;
     const nextCommittedSettings = {
       ...committedSettingsRef.current,
       presets: nextPresets,
+      macroProfiles: nextMacroProfiles,
       activePresetId: preset.id,
     };
     const nextUiSettings = {
       ...uiSettingsRef.current,
       presets: nextPresets,
+      macroProfiles: nextMacroProfiles,
       activePresetId: preset.id,
     };
 
@@ -439,9 +474,13 @@ export default function App() {
       return false;
     }
 
+    const associatedMacro = committedSettingsRef.current.macroProfiles.find(
+      (profile) => profile.sourcePresetId === presetId,
+    );
     updateSettings({
       ...preset.settings,
       activePresetId: presetId,
+      ...(associatedMacro ? { activeMacroId: associatedMacro.id } : {}),
     });
     return true;
   };
@@ -471,14 +510,55 @@ export default function App() {
       return false;
     }
 
+    const activeMacro = committedSettingsRef.current.macroProfiles.find(
+      (profile) => profile.id === committedSettingsRef.current.activeMacroId,
+    );
+    const associatedMacro = committedSettingsRef.current.macroProfiles.find(
+      (profile) => profile.sourcePresetId === presetId,
+    );
+    const now = new Date().toISOString();
+    const nextMacroProfiles = activeMacro
+      ? associatedMacro
+        ? committedSettingsRef.current.macroProfiles.map((profile) =>
+            profile.id === associatedMacro.id
+              ? {
+                  ...activeMacro,
+                  id: associatedMacro.id,
+                  name: associatedMacro.name,
+                  sourcePresetId: presetId,
+                  createdAt: associatedMacro.createdAt,
+                  updatedAt: now,
+                }
+              : profile,
+          )
+        : [
+            ...committedSettingsRef.current.macroProfiles,
+            {
+              ...activeMacro,
+              id:
+                globalThis.crypto?.randomUUID?.() ??
+                "macro-" +
+                  Date.now() +
+                  "-" +
+                  Math.random().toString(36).slice(2, 8),
+              name: (activeMacro.name + " (" + presetId + ")").slice(0, 80),
+              sourcePresetId: presetId,
+              createdAt: now,
+              updatedAt: now,
+            },
+          ]
+      : committedSettingsRef.current.macroProfiles;
+
     const nextCommittedSettings = {
       ...committedSettingsRef.current,
       presets: nextPresets,
+      macroProfiles: nextMacroProfiles,
       activePresetId: presetId,
     };
     const nextUiSettings = {
       ...uiSettingsRef.current,
       presets: nextPresets,
+      macroProfiles: nextMacroProfiles,
       activePresetId: presetId,
     };
 
@@ -730,7 +810,15 @@ export default function App() {
         ]) => {
           if (!mounted) return;
 
-          let hydratedSettings = loadedSettings;
+          const macroMigration = migrateLegacyMacroProfiles(loadedSettings);
+          let hydratedSettings = macroMigration.changed
+            ? {
+                ...loadedSettings,
+                macroProfiles: macroMigration.profiles,
+                activeMacroId: macroMigration.activeMacroId,
+                macroMigrationVersion: 1,
+              }
+            : loadedSettings;
 
           let registeredHotkey: string;
           try {
@@ -796,6 +884,7 @@ export default function App() {
           await syncSettingsToBackend(hydratedSettings);
 
           if (
+            macroMigration.changed ||
             hydratedSettings.hotkey !== loadedSettings.hotkey ||
             hydratedSettings.alwaysOnTop !== loadedSettings.alwaysOnTop
           ) {
@@ -842,6 +931,25 @@ export default function App() {
       }
     };
   }, []);
+
+  useEffect(() => {
+    if (!settingsLoaded) return;
+    invoke("macro_set_context", {
+      active: tab === "click-points",
+      source: activeMacro?.source ?? "",
+      selectedHwnd: activeMacro?.target?.hwnd ?? null,
+      selectedPid: activeMacro?.target?.pid ?? null,
+    }).catch((err) =>
+      error(JSON.stringify({ source: "App.macroContext", error: String(err) })),
+    );
+  }, [
+    settingsLoaded,
+    tab,
+    activeMacro?.id,
+    activeMacro?.source,
+    activeMacro?.target?.hwnd,
+    activeMacro?.target?.pid,
+  ]);
 
   useEffect(() => {
     let cleanup: (() => void) | undefined;
@@ -1310,6 +1418,14 @@ export default function App() {
 
   const handleTabChange = useCallback(
     (nextTab: Tab) => {
+      if (
+        tab === "click-points" &&
+        nextTab !== tab &&
+        macroDirty &&
+        !window.confirm("Discard unsaved macro changes?")
+      ) {
+        return;
+      }
       setTab(nextTab);
 
       if (nextTab === "settings") return;
@@ -1319,7 +1435,7 @@ export default function App() {
         lastPanel: nextTab,
       });
     },
-    [updateSettings],
+    [macroDirty, tab, updateSettings],
   );
 
   const handleResetSettings = async () => {
@@ -1335,8 +1451,18 @@ export default function App() {
       await invoke("set_autostart_enabled", { enabled: false }).catch(() => {});
       await getCurrentWindow().setAlwaysOnTop(DEFAULT_SETTINGS.alwaysOnTop);
 
+      const resetMacros = migrateLegacyMacroProfiles({
+        ...DEFAULT_SETTINGS,
+        macroMigrationVersion: 0,
+      });
+      const resetSettings: Settings = {
+        ...DEFAULT_SETTINGS,
+        macroProfiles: resetMacros.profiles,
+        activeMacroId: resetMacros.activeMacroId,
+        macroMigrationVersion: 1,
+      };
       lastValidHotkeyRef.current = DEFAULT_SETTINGS.hotkey;
-      persistCommittedSettings(DEFAULT_SETTINGS, DEFAULT_SETTINGS);
+      persistCommittedSettings(resetSettings, resetSettings);
       setTab("simple");
       launchWindowPlacementDone.current = false;
     } catch (err) {
@@ -1732,13 +1858,24 @@ export default function App() {
           <AdvancedPanel settings={settings} update={updateSettings} />
         )}
         {tab === "click-points" && (
-          <ClickPointsPanel
+          <MacroPanel
             settings={settings}
             update={updateSettings}
-            showInfo={true}
+            onDirtyChange={setMacroDirty}
             running={status.running}
-            activeClickPointIndex={status.activeClickPointIndex}
-            activeClickPointTick={status.activeClickPointTick}
+            paused={status.paused}
+            stopReason={status.stopReason}
+            statusError={status.lastError}
+            primaryHotkey={settings.hotkey}
+            onRun={async (source, targetHwnd, targetPid) => {
+              await invoke("macro_set_context", {
+                active: true,
+                source,
+                selectedHwnd: targetHwnd,
+                selectedPid: targetPid,
+              });
+              await invoke("macro_start");
+            }}
           />
         )}
         {tab === "zones" && (

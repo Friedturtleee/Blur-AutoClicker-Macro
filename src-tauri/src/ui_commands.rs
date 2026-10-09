@@ -176,6 +176,11 @@ pub fn start_click_point_pick(app: AppHandle) -> AppResult<()> {
 }
 
 #[tauri::command]
+pub fn start_macro_coordinate_pick(app: AppHandle) -> AppResult<()> {
+    crate::click_point_picker::start_macro_coordinate_pick_inner(app)
+}
+
+#[tauri::command]
 pub fn cancel_click_point_pick(app: AppHandle) -> AppResult<()> {
     crate::click_point_picker::cancel_click_point_pick_inner(&app);
     Ok(())
@@ -255,6 +260,68 @@ pub fn list_processes() -> AppResult<Vec<crate::engine::process::ProcessInfo>> {
 #[tauri::command]
 pub fn was_autostart_launch() -> bool {
     std::env::args().any(|a| a == "--autostart")
+}
+
+#[tauri::command]
+pub fn macro_validate(source: String) -> crate::macro_engine::MacroValidation {
+    crate::macro_engine::validate_source(&source)
+}
+
+#[tauri::command]
+pub fn macro_set_context(
+    app: AppHandle,
+    active: bool,
+    source: String,
+    selected_hwnd: Option<u64>,
+    selected_pid: Option<u32>,
+) -> AppResult<()> {
+    crate::macro_engine::set_macro_context(&app, active, source, selected_hwnd, selected_pid);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn macro_start(app: AppHandle) -> AppResult<ClickerStatusPayload> {
+    crate::macro_engine::start_macro_inner(&app)
+}
+
+#[tauri::command]
+pub fn macro_stop(app: AppHandle) -> AppResult<ClickerStatusPayload> {
+    stop_clicker_inner(&app, Some(String::from("Macro cancelled by user")))
+}
+
+#[tauri::command]
+pub fn macro_pause(app: AppHandle) -> AppResult<ClickerStatusPayload> {
+    let state = app.state::<ClickerState>();
+    if state.running.load(Ordering::SeqCst) && state.active_job_is_macro.load(Ordering::SeqCst) {
+        state.paused.store(true, Ordering::SeqCst);
+        use tauri::Emitter;
+        let _ = app.emit("macro:state", serde_json::json!({ "state": "Paused" }));
+        emit_status(&app);
+    }
+    Ok(current_status(&app))
+}
+
+#[tauri::command]
+pub fn macro_resume(app: AppHandle) -> AppResult<ClickerStatusPayload> {
+    let state = app.state::<ClickerState>();
+    if state.running.load(Ordering::SeqCst) && state.active_job_is_macro.load(Ordering::SeqCst) {
+        state.paused.store(false, Ordering::SeqCst);
+        use tauri::Emitter;
+        let _ = app.emit("macro:state", serde_json::json!({ "state": "Running" }));
+        emit_status(&app);
+    }
+    Ok(current_status(&app))
+}
+
+#[tauri::command]
+pub fn list_target_windows() -> Vec<crate::target_window::TargetWindow> {
+    crate::target_window::list_target_windows()
+}
+
+#[tauri::command]
+pub fn probe_target_window(hwnd: u64) -> AppResult<crate::target_window::TargetCapabilities> {
+    let target = crate::target_window::resolve_selected_target(hwnd).map_err(AppError::State)?;
+    Ok(crate::target_window::target_capabilities(&target))
 }
 
 #[tauri::command]

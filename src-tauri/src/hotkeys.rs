@@ -1,6 +1,6 @@
 use crate::engine::worker::emit_status;
 use crate::engine::worker::now_epoch_ms;
-use crate::engine::worker::start_clicker_inner;
+use crate::engine::worker::start_selected_job_inner;
 use crate::engine::worker::stop_clicker_inner;
 use crate::engine::worker::toggle_clicker_inner;
 use crate::engine::AUTOCLICKER_EXTRA_INFO;
@@ -474,6 +474,8 @@ pub fn start_hotkey_listener(app: AppHandle) {
         let mut was_pressed = false;
         let mut was_suppressed = false;
         let mut master_was_pressed = false;
+        let mut emergency_was_pressed = false;
+        let mut recorder_was_pressed = false;
         let mut last_check = Instant::now();
         let mut msg: MSG = std::mem::zeroed();
 
@@ -487,7 +489,7 @@ pub fn start_hotkey_listener(app: AppHandle) {
             if last_check.elapsed() >= POLL_INTERVAL {
                 last_check = Instant::now();
 
-                let (binding, strict) = {
+                let (binding, strict, emergency_hotkey, recording_hotkey, record_cursor) = {
                     let binding = state
                         .registered_hotkey
                         .lock()
@@ -498,7 +500,14 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         .lock()
                         .unwrap_or_else(poisoned_inner)
                         .strict_hotkey_modifiers;
-                    (binding, strict)
+                    let settings = state.settings.lock().unwrap_or_else(poisoned_inner);
+                    (
+                        binding,
+                        strict,
+                        settings.emergency_stop_hotkey.clone(),
+                        settings.recording_hotkey.clone(),
+                        settings.record_cursor_movement,
+                    )
                 };
 
                 let running = state.running.load(Ordering::SeqCst);
@@ -566,6 +575,25 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         stop_clicker_inner(&app, Some(String::from("Stopped by master switch")));
                 }
 
+                let emergency_binding = parse_hotkey_binding(&emergency_hotkey).ok();
+                let emergency_pressed = emergency_binding
+                    .as_ref()
+                    .map(|candidate| hotkey_is_pressed(candidate, strict, running))
+                    .unwrap_or(false);
+                if emergency_pressed && !emergency_was_pressed {
+                    if state.running.load(Ordering::SeqCst) {
+                        let _ =
+                            stop_clicker_inner(&app, Some(String::from("Emergency stop hotkey")));
+                    }
+                    crate::recorder::stop_recording_from_hotkey();
+                }
+                emergency_was_pressed = emergency_pressed;
+                if emergency_pressed {
+                    was_pressed = false;
+                    was_suppressed = false;
+                    continue;
+                }
+
                 let suppress_until = state.suppress_hotkey_until_ms.load(Ordering::SeqCst);
                 let suppress_until_release =
                     state.suppress_hotkey_until_release.load(Ordering::SeqCst);
@@ -591,6 +619,33 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         }
                     }
                     was_pressed = currently_pressed;
+                    continue;
+                }
+
+                let recording_binding = parse_hotkey_binding(&recording_hotkey).ok();
+                let recorder_conflicts = binding
+                    .as_ref()
+                    .zip(recording_binding.as_ref())
+                    .is_some_and(|(a, b)| a == b)
+                    || emergency_binding
+                        .as_ref()
+                        .zip(recording_binding.as_ref())
+                        .is_some_and(|(a, b)| a == b);
+                let recording_pressed = if running || recorder_conflicts {
+                    false
+                } else {
+                    recording_binding
+                        .as_ref()
+                        .map(|candidate| hotkey_is_pressed(candidate, strict, false))
+                        .unwrap_or(false)
+                };
+                if recording_pressed && !recorder_was_pressed {
+                    crate::recorder::toggle_recording_from_hotkey(&app, record_cursor);
+                }
+                recorder_was_pressed = recording_pressed;
+                if recording_pressed {
+                    was_pressed = false;
+                    was_suppressed = false;
                     continue;
                 }
 
@@ -621,7 +676,7 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         was_suppressed = true;
                     } else {
                         was_suppressed = false;
-                        if master_allowed {
+                        if master_allowed && !recording_pressed {
                             handle_hotkey_pressed(&app);
                         }
                     }
@@ -649,6 +704,15 @@ pub fn start_hotkey_listener(app: AppHandle) {
             UnhookWindowsHookEx(kb_hook);
         }
     });
+}
+
+fn hotkey_is_pressed(binding: &HotkeyBinding, strict: bool, running: bool) -> bool {
+    if HOOKS_ACTIVE.load(Ordering::Relaxed) {
+        is_hotkey_binding_pressed_physical(binding, strict)
+            || (!running && is_hotkey_binding_pressed(binding, strict))
+    } else {
+        is_hotkey_binding_pressed(binding, strict)
+    }
 }
 
 fn is_mouse_hotkey_binding(binding: &HotkeyBinding) -> bool {
@@ -729,7 +793,7 @@ pub fn handle_hotkey_pressed(app: &AppHandle) {
             log::error!("[Hotkey] Toggle failed: {e}");
         }
     } else if mode == "Hold" {
-        if let Err(e) = start_clicker_inner(app) {
+        if let Err(e) = start_selected_job_inner(app) {
             log::error!("[Hotkey] Start failed: {e}");
         }
     }

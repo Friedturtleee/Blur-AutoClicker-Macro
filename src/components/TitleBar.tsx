@@ -212,7 +212,7 @@ const TAB_ITEMS: readonly TabItem[] = [
   },
   {
     value: "click-points",
-    label: "Click Points",
+    label: "Macro",
     color: "hsl(180 75% 40%)",
     activeBg: "hsla(180, 75%, 40%, 0.14)",
     activeFocusRing: "hsla(180, 75%, 40%, 0.35)",

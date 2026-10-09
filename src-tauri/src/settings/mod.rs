@@ -27,6 +27,14 @@ fn default_true() -> bool {
     true
 }
 
+fn default_recording_hotkey() -> String {
+    "ctrl+shift+r".to_string()
+}
+
+fn default_emergency_stop_hotkey() -> String {
+    "ctrl+shift+f12".to_string()
+}
+
 use crate::engine::ProcessListEntry;
 
 #[derive(Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize, Debug)]
@@ -112,6 +120,12 @@ pub struct ClickerSettings {
     #[serde(default = "default_true")]
     pub task_switcher_stop_enabled: bool,
     pub hotkey: String,
+    #[serde(default = "default_recording_hotkey")]
+    pub recording_hotkey: String,
+    #[serde(default = "default_emergency_stop_hotkey")]
+    pub emergency_stop_hotkey: String,
+    #[serde(default = "default_true")]
+    pub record_cursor_movement: bool,
     pub rate_input_mode: String,
     pub duration_hours: u32,
     pub duration_minutes: u32,
@@ -137,7 +151,7 @@ impl Default for ClickerSettings {
     fn default() -> Self {
         Self {
             // Meta
-            version: 10,
+            version: 11,
 
             // Preset snapshot fields
             click_speed: 25.0,
@@ -191,6 +205,9 @@ impl Default for ClickerSettings {
             // settings-only defaults
             task_switcher_stop_enabled: true,
             hotkey: "ctrl+y".to_string(),
+            recording_hotkey: default_recording_hotkey(),
+            emergency_stop_hotkey: default_emergency_stop_hotkey(),
+            record_cursor_movement: true,
             rate_input_mode: "rate".to_string(),
             duration_hours: 0,
             duration_minutes: 0,

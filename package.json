@@ -13,13 +13,19 @@
     "test:watch": "vitest",
     "lint": "eslint .",
     "preview": "vite preview",
-    "format:check": "prettier --check \"src/**/*.{ts,tsx,css}\"",
+    "format:check": "node scripts/format-check.mjs",
     "format:write": "prettier --write \"src/**/*.{ts,tsx,css}\"",
     "check": "node scripts/check.mjs",
     "check:fix": "node scripts/check.mjs --fix",
     "prepare": "lefthook install"
   },
   "dependencies": {
+    "@codemirror/autocomplete": "^6.20.3",
+    "@codemirror/language": "^6.13.1",
+    "@codemirror/lint": "^6.9.7",
+    "@codemirror/state": "^6.7.6",
+    "@codemirror/view": "^6.43.14",
+    "@lezer/highlight": "^1.2.5",
     "@tauri-apps/api": "^2.10.1",
     "@tauri-apps/cli": "^2.10.1",
     "@tauri-apps/plugin-dialog": "^2.7.1",
@@ -29,6 +35,7 @@
     "@tauri-apps/plugin-process": "^2.3.1",
     "@tauri-apps/plugin-store": "^2.4.2",
     "@tauri-apps/plugin-updater": "^2.10.1",
+    "codemirror": "^6.0.2",
     "react": "^19.2.4",
     "react-dom": "^19.2.4"
   },

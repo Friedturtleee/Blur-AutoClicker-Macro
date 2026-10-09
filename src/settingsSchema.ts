@@ -1,3 +1,5 @@
+import type { MacroProfile } from "./macro/types";
+
 export type ClickInterval = "s" | "m" | "h" | "d";
 export type MouseButton = "Left" | "Middle" | "Right";
 export type InputType = "mouse" | "keyboard";
@@ -347,6 +349,15 @@ const SETTINGS_ONLY_FIELDS = {
   strictHotkeyModifiers: {
     default: false,
     ui: { section: "behavior", control: "toggle" },
+  },
+  recordingHotkey: {
+    default: "ctrl+shift+r",
+  },
+  emergencyStopHotkey: {
+    default: "ctrl+shift+f12",
+  },
+  recordCursorMovement: {
+    default: true,
   },
   taskSwitcherStopEnabled: {
     default: true,
@@ -717,6 +728,9 @@ export interface PresetDefinition {
 export type Settings = PresetFieldValues &
   SettingsOnlyFieldValues & {
     version: string;
+    macroProfiles: MacroProfile[];
+    activeMacroId: string | null;
+    macroMigrationVersion: number;
   };
 
 export const FACTORY_PRESETS: PresetDefinition[] = [
@@ -1118,6 +1132,9 @@ export function createDefaultSettings(version: string): Settings {
     version,
     ...PRESET_DEFAULTS,
     ...SETTINGS_ONLY_DEFAULTS,
+    macroProfiles: [],
+    activeMacroId: null,
+    macroMigrationVersion: 0,
   };
 }
 
@@ -1442,6 +1459,17 @@ export function sanitizeSettings(
       ? saved.activePresetId
       : null;
 
+  const macroProfiles = sanitizeMacroProfiles(savedRecord.macroProfiles);
+  const activeMacroId =
+    typeof savedRecord.activeMacroId === "string" &&
+    macroProfiles.some((profile) => profile.id === savedRecord.activeMacroId)
+      ? savedRecord.activeMacroId
+      : null;
+  const macroMigrationVersion = Math.max(
+    0,
+    Math.min(1, Math.trunc(clampNumber(savedRecord.macroMigrationVersion, 0))),
+  );
+
   if (presetSettings.dutyCycleMode === "Hold") {
     presetSettings.clickSpeed = 1;
     presetSettings.clickInterval = "d";
@@ -1452,5 +1480,82 @@ export function sanitizeSettings(
     version,
     ...presetSettings,
     ...settingsOnly,
+    macroProfiles,
+    activeMacroId,
+    macroMigrationVersion,
   };
+}
+
+function sanitizeMacroProfiles(input: unknown): MacroProfile[] {
+  if (!Array.isArray(input)) return [];
+  return input
+    .slice(0, 100)
+    .map((value, index) => {
+      if (!value || typeof value !== "object") return null;
+      const raw = value as Record<string, unknown>;
+      const source =
+        typeof raw.source === "string" ? raw.source.slice(0, 1_000_000) : "";
+      const name =
+        typeof raw.name === "string" && raw.name.trim()
+          ? raw.name.trim().slice(0, 80)
+          : "Macro " + (index + 1);
+      const targetRaw =
+        raw.target && typeof raw.target === "object"
+          ? (raw.target as Record<string, unknown>)
+          : null;
+      let target: MacroProfile["target"] = null;
+      if (
+        targetRaw &&
+        typeof targetRaw.hwnd === "number" &&
+        Number.isFinite(targetRaw.hwnd) &&
+        typeof targetRaw.pid === "number" &&
+        Number.isFinite(targetRaw.pid) &&
+        typeof targetRaw.processName === "string"
+      ) {
+        target = {
+          hwnd: Math.trunc(targetRaw.hwnd),
+          pid: Math.trunc(targetRaw.pid),
+          processName: targetRaw.processName.slice(0, 260),
+          title:
+            typeof targetRaw.title === "string"
+              ? targetRaw.title.slice(0, 1024)
+              : "",
+          className:
+            typeof targetRaw.className === "string"
+              ? targetRaw.className.slice(0, 256)
+              : "",
+          visible: targetRaw.visible === true,
+          minimized: targetRaw.minimized === true,
+          clientWidth:
+            typeof targetRaw.clientWidth === "number"
+              ? Math.trunc(targetRaw.clientWidth)
+              : 0,
+          clientHeight:
+            typeof targetRaw.clientHeight === "number"
+              ? Math.trunc(targetRaw.clientHeight)
+              : 0,
+          dpi:
+            typeof targetRaw.dpi === "number" ? Math.trunc(targetRaw.dpi) : 96,
+        };
+      }
+      const fallbackDate = new Date(0).toISOString();
+      return {
+        id:
+          typeof raw.id === "string" && raw.id.trim()
+            ? raw.id.trim().slice(0, 128)
+            : "macro-" + (index + 1),
+        name,
+        source,
+        syntaxVersion: 1 as const,
+        target,
+        createdAt:
+          typeof raw.createdAt === "string" ? raw.createdAt : fallbackDate,
+        updatedAt:
+          typeof raw.updatedAt === "string" ? raw.updatedAt : fallbackDate,
+        ...(typeof raw.sourcePresetId === "string"
+          ? { sourcePresetId: raw.sourcePresetId.slice(0, 128) }
+          : {}),
+      };
+    })
+    .filter((profile): profile is MacroProfile => profile !== null);
 }

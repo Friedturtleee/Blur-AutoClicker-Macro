@@ -102,7 +102,7 @@ async function guardRunningInstance() {
   if (process.platform === 'win32') {
     const r = spawnSync('tasklist', ['/NH'], { encoding: 'utf8', shell: true });
     const out = r.stdout || '';
-    running = /BlurAutoClicker/i.test(out) || /crashpad_handler/i.test(out);
+    running = /BlurAutoClicker/i.test(out);
   } else {
     const r = spawnSync('pgrep', ['-f', 'BlurAutoClicker|crashpad_handler'], {
       encoding: 'utf8',

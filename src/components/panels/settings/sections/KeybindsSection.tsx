@@ -11,7 +11,7 @@ const PAGES = [
   { key: "keybindSimple" as const, label: "Simple" },
   { key: "keybindAdvanced" as const, label: "Advanced" },
   { key: "keybindZones" as const, label: "Zones" },
-  { key: "keybindClickPoints" as const, label: "Click Points" },
+  { key: "keybindClickPoints" as const, label: "Macro" },
   { key: "keybindSettings" as const, label: "Settings" },
 ];
 
@@ -75,11 +75,11 @@ const TOGGLE_GROUPS: {
     ],
   },
   {
-    title: "Click Points",
+    title: "Macro",
     items: [
       {
         key: "keybindToggleClickPoints",
-        label: "Click Points",
+        label: "Macro",
         sublabel: "Toggle on or off.",
       },
       {

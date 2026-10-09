@@ -31,7 +31,7 @@ const PAGES = [
   { suffix: "Simple", label: "Simple Page" },
   { suffix: "Advanced", label: "Advanced Page" },
   { suffix: "Zones", label: "Zones Page" },
-  { suffix: "ClickPoints", label: "Click Points Page" },
+  { suffix: "ClickPoints", label: "Macro Page" },
   { suffix: "Settings", label: "Settings Page" },
 ] as const;
 

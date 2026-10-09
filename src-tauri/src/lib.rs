@@ -2,6 +2,7 @@ mod crash_handler;
 mod diagnostics;
 mod error;
 mod portable;
+mod recorder;
 mod settings;
 pub use settings::ClickerSettings;
 mod app_events;
@@ -12,7 +13,9 @@ mod custom_stop_zone_picker;
 mod engine;
 mod hotkeys;
 mod icon;
+mod macro_engine;
 mod overlay;
+mod target_window;
 mod ui_commands;
 mod updates;
 mod window_lifecycle;
@@ -446,6 +449,12 @@ fn create_clicker_state() -> ClickerState {
         click_point_pick_active: AtomicBool::new(false),
         custom_stop_zone_pick_active: AtomicBool::new(false),
         settings_initialized: AtomicBool::new(false),
+        macro_mode_active: AtomicBool::new(false),
+        macro_source: Mutex::new(String::new()),
+        macro_target_hwnd: Mutex::new(None),
+        macro_target_pid: Mutex::new(None),
+        active_job_is_macro: AtomicBool::new(false),
+        recording_active: AtomicBool::new(false),
         paused: Arc::new(AtomicBool::new(false)),
         paused_by_zone: AtomicBool::new(false),
         zone_started_clicker: AtomicBool::new(false),
@@ -560,6 +569,7 @@ pub fn run() {
             ui_commands::register_master,
             ui_commands::pick_position,
             ui_commands::start_click_point_pick,
+            ui_commands::start_macro_coordinate_pick,
             ui_commands::cancel_click_point_pick,
             ui_commands::start_custom_stop_zone_pick,
             ui_commands::cancel_custom_stop_zone_pick,
@@ -576,6 +586,17 @@ pub fn run() {
             ui_commands::set_autostart_enabled,
             ui_commands::list_processes,
             ui_commands::was_autostart_launch,
+            ui_commands::macro_validate,
+            ui_commands::macro_set_context,
+            ui_commands::macro_start,
+            ui_commands::macro_stop,
+            ui_commands::macro_pause,
+            ui_commands::macro_resume,
+            ui_commands::list_target_windows,
+            ui_commands::probe_target_window,
+            recorder::recorder_start,
+            recorder::recorder_stop,
+            recorder::recorder_events_to_script,
             ui_commands::get_diagnostics_info,
             ui_commands::open_diagnostics_folder,
             ui_commands::export_diagnostics_bundle,
@@ -591,6 +612,7 @@ pub fn run() {
                     // Central shutdown: fires for window close, tray quit,
                     // quit_app, and updater restarts. Drops the crashpad client
                     // so crashpad_handler.exe terminates instead of being orphaned.
+                    crate::recorder::stop_active_recording();
                     crate::crash_handler::shutdown_crashpad();
                 }
                 tauri::RunEvent::WindowEvent { event, label, .. } => match event {

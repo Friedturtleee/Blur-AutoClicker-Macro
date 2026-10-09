@@ -386,6 +386,9 @@ export function AdvDropdown({
   hoverWheel = true,
   allowWindowOverflow = false,
   windowOverflowBottom = 190,
+  ariaLabel,
+  disabled = false,
+  className = "",
 }: {
   value: string;
   options: readonly { value: string; label: string }[];
@@ -393,6 +396,9 @@ export function AdvDropdown({
   hoverWheel?: boolean;
   allowWindowOverflow?: boolean;
   windowOverflowBottom?: number;
+  ariaLabel?: string;
+  disabled?: boolean;
+  className?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [positioned, setPositioned] = useState(false);
@@ -402,6 +408,7 @@ export function AdvDropdown({
   const menuRef = useRef<HTMLDivElement>(null);
 
   const toggle = () => {
+    if (disabled) return;
     setOpen((prev) => {
       const next = !prev;
       if (next) {
@@ -492,7 +499,7 @@ export function AdvDropdown({
   }, [open]);
 
   const handleWheel = (e: WheelEvent) => {
-    if (!hoverWheel || open) return;
+    if (!hoverWheel || disabled || open) return;
     e.preventDefault();
     const currentIndex = options.findIndex((o) => o.value === value);
     if (currentIndex === -1) return;
@@ -509,8 +516,20 @@ export function AdvDropdown({
   const activeLabel = options.find((o) => o.value === value)?.label ?? value;
 
   return (
-    <div className="adv-dropdown" ref={ref} onWheel={handleWheel}>
-      <button type="button" className="adv-dropdown-trigger" onClick={toggle}>
+    <div
+      className={`adv-dropdown ${className}`.trim()}
+      ref={ref}
+      onWheel={handleWheel}
+    >
+      <button
+        type="button"
+        className="adv-dropdown-trigger"
+        aria-label={ariaLabel}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        disabled={disabled}
+        onClick={toggle}
+      >
         <span>{activeLabel}</span>
         <svg
           width="10"
@@ -533,6 +552,8 @@ export function AdvDropdown({
           <div
             ref={menuRef}
             className="adv-dropdown-menu adv-dropdown-menu--portal"
+            role="listbox"
+            aria-label={ariaLabel}
             aria-hidden={!positioned}
             style={{
               position: "fixed",
@@ -549,6 +570,8 @@ export function AdvDropdown({
                 key={option.value}
                 type="button"
                 className={`adv-dropdown-item ${option.value === value ? "active" : ""}`}
+                role="option"
+                aria-selected={option.value === value}
                 onClick={() => {
                   onChange(option.value);
                   setOpen(false);

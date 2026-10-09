@@ -50,6 +50,13 @@ enum KeyboardHookDecision {
     Cancel,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum PickerPurpose {
+    #[default]
+    ClickPoints,
+    MacroCoordinate,
+}
+
 #[derive(Default)]
 struct PickerRuntime {
     active: bool,
@@ -57,6 +64,7 @@ struct PickerRuntime {
     keyboard_hook: HHOOK,
     thread_id: u32,
     app: Option<AppHandle>,
+    purpose: PickerPurpose,
     last_cursor_emit: Option<Instant>,
     stop_after_right_up: bool,
 }
@@ -91,17 +99,31 @@ fn classify_keyboard_message(message: u32, virtual_key: u32) -> KeyboardHookDeci
 }
 
 pub fn start_click_point_pick_inner(app: AppHandle) -> AppResult<()> {
+    start_coordinate_picker(app, PickerPurpose::ClickPoints)
+}
+
+pub fn start_macro_coordinate_pick_inner(app: AppHandle) -> AppResult<()> {
+    start_coordinate_picker(app, PickerPurpose::MacroCoordinate)
+}
+
+fn start_coordinate_picker(app: AppHandle, purpose: PickerPurpose) -> AppResult<()> {
     crate::custom_stop_zone_picker::cancel_custom_stop_zone_pick_inner(&app);
 
     {
         let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
         if runtime.active {
-            crate::overlay::show_click_point_pick_overlay(&app)?;
+            match runtime.purpose {
+                PickerPurpose::ClickPoints => crate::overlay::show_click_point_pick_overlay(&app)?,
+                PickerPurpose::MacroCoordinate => {
+                    crate::overlay::show_macro_coordinate_pick_overlay(&app)?
+                }
+            }
             return Ok(());
         }
 
         runtime.active = true;
         runtime.app = Some(app.clone());
+        runtime.purpose = purpose;
         runtime.last_cursor_emit = None;
         runtime.stop_after_right_up = false;
     }
@@ -110,7 +132,12 @@ pub fn start_click_point_pick_inner(app: AppHandle) -> AppResult<()> {
         .click_point_pick_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    crate::overlay::show_click_point_pick_overlay(&app)?;
+    match purpose {
+        PickerPurpose::ClickPoints => crate::overlay::show_click_point_pick_overlay(&app)?,
+        PickerPurpose::MacroCoordinate => {
+            crate::overlay::show_macro_coordinate_pick_overlay(&app)?
+        }
+    }
 
     let (ready_tx, ready_rx) = mpsc::channel();
     std::thread::spawn(move || unsafe {
@@ -319,23 +346,20 @@ fn emit_cursor_position(x: i32, y: i32) {
 }
 
 fn emit_pick(x: i32, y: i32, continue_picking: bool) {
-    let app = {
+    let (app, purpose) = {
         let runtime = picker().lock().unwrap_or_else(poisoned_inner);
         if !runtime.active {
             return;
         }
-        runtime.app.clone()
+        (runtime.app.clone(), runtime.purpose)
     };
 
     if let Some(app) = app {
-        let _ = app.emit(
-            "click-point-picked",
-            ClickPointPickedPayload {
-                x,
-                y,
-                continue_picking,
-            },
-        );
+        let event_name = match purpose {
+            PickerPurpose::ClickPoints => "click-point-picked",
+            PickerPurpose::MacroCoordinate => "macro-coordinate-picked",
+        };
+        let _ = app.emit(event_name, ClickPointPickedPayload { x, y, continue_picking });
     }
 }
 
