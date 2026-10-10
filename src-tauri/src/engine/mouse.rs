@@ -48,14 +48,10 @@ impl VirtualScreenRect {
     }
 
     fn normalize_x(&self, pixel_x: i32) -> i32 {
-        let relative_x = pixel_x as f64 - self.left as f64;
-        let ratio = relative_x / self.width as f64;
-        (ratio * 65535.0).round() as i32
+        normalize_absolute_coordinate(pixel_x, self.left, self.width)
     }
     fn normalize_y(&self, pixel_y: i32) -> i32 {
-        let relative_y = pixel_y as f64 - self.top as f64;
-        let ratio = relative_y / self.height as f64;
-        (ratio * 65535.0).round() as i32
+        normalize_absolute_coordinate(pixel_y, self.top, self.height)
     }
 
     #[inline]
@@ -67,6 +63,18 @@ impl VirtualScreenRect {
             self.height,
         )
     }
+}
+
+fn normalize_absolute_coordinate(pixel: i32, origin: i32, extent: i32) -> i32 {
+    if extent <= 1 {
+        return 0;
+    }
+
+    let last_pixel_offset = f64::from(extent - 1);
+    let offset = f64::from(pixel) - f64::from(origin);
+    ((offset / last_pixel_offset) * 65535.0)
+        .round()
+        .clamp(0.0, 65535.0) as i32
 }
 
 pub fn current_cursor_position() -> Option<(i32, i32)> {
@@ -154,13 +162,23 @@ pub fn get_cursor_pos() -> (i32, i32) {
 
 #[inline]
 pub fn move_mouse(target_x: i32, target_y: i32) {
+    let _ = try_move_mouse(target_x, target_y);
+}
+
+pub fn try_move_mouse(target_x: i32, target_y: i32) -> Result<(), String> {
     if let Some(screen_rect) = current_virtual_screen_rect() {
         let end_x = screen_rect.normalize_x(target_x);
         let end_y = screen_rect.normalize_y(target_y);
 
         let movement = make_movement(end_x, end_y);
-        unsafe { SendInput(1, &movement, std::mem::size_of::<INPUT>() as i32) };
-        log::debug!("moved cursor x:{end_x}, y:{end_y}")
+        let accepted = unsafe { SendInput(1, &movement, std::mem::size_of::<INPUT>() as i32) };
+        if accepted != 1 {
+            return Err("Windows did not accept the cursor movement input.".into());
+        }
+        log::debug!("moved cursor x:{end_x}, y:{end_y}");
+        Ok(())
+    } else {
+        Err("Could not determine the virtual screen dimensions.".into())
     }
 }
 
@@ -200,8 +218,17 @@ pub fn make_input(flags: u32, time: u32) -> INPUT {
 
 #[inline]
 pub fn send_mouse_event(flags: u32) {
+    let _ = try_send_mouse_event(flags);
+}
+
+pub fn try_send_mouse_event(flags: u32) -> Result<(), String> {
     let input = make_input(flags, 0);
-    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    let accepted = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    if accepted == 1 {
+        Ok(())
+    } else {
+        Err("Windows did not accept the mouse input.".into())
+    }
 }
 
 pub fn send_batch(down: u32, up: u32, n: usize) {
@@ -398,4 +425,27 @@ pub fn smooth_move(
     rng: &mut crate::engine::rng::SmallRng,
 ) {
     smooth_move_inner(start_x, start_y, end_x, end_y, duration_ms, rng, true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_absolute_coordinate, VirtualScreenRect};
+
+    #[test]
+    fn maps_virtual_screen_edges_to_the_full_absolute_range() {
+        let screen = VirtualScreenRect::new(-1920, -200, 1920, 1080);
+
+        assert_eq!(screen.normalize_x(-1920), 0);
+        assert_eq!(screen.normalize_x(-1), 65535);
+        assert_eq!(screen.normalize_y(-200), 0);
+        assert_eq!(screen.normalize_y(879), 65535);
+    }
+
+    #[test]
+    fn clamps_outside_points_and_handles_single_pixel_extent() {
+        assert_eq!(normalize_absolute_coordinate(-10, 0, 100), 0);
+        assert_eq!(normalize_absolute_coordinate(120, 0, 100), 65535);
+        assert_eq!(normalize_absolute_coordinate(0, 0, 1), 0);
+        assert_eq!(normalize_absolute_coordinate(10, 0, 0), 0);
+    }
 }

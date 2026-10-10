@@ -12,6 +12,7 @@ export interface MacroVisualAction {
   space: CoordinateSpace;
   button?: string;
   count?: number;
+  radius?: number;
   delta?: number;
 }
 
@@ -22,6 +23,7 @@ export interface MacroClickPoint {
   firstOrder: number;
   clicks: number;
   button: string;
+  radius: number;
 }
 
 export interface MacroVisualization {
@@ -34,6 +36,19 @@ interface CursorPosition {
   y: number;
   space: CoordinateSpace;
 }
+
+const INTEGER_OPTION_PATTERNS: Record<string, RegExp> = {
+  x: /(?:^|\s)x=(-?\d+)(?=\s|$)/,
+  y: /(?:^|\s)y=(-?\d+)(?=\s|$)/,
+  count: /(?:^|\s)count=(-?\d+)(?=\s|$)/,
+  radius: /(?:^|\s)radius=(-?\d+)(?=\s|$)/,
+  delta: /(?:^|\s)delta=(-?\d+)(?=\s|$)/,
+};
+
+const STRING_OPTION_PATTERNS: Record<string, RegExp> = {
+  button: /(?:^|\s)button=([\w-]+)(?=\s|$)/,
+  space: /(?:^|\s)space=([\w-]+)(?=\s|$)/,
+};
 
 function stripComment(line: string): string {
   let quoted = false;
@@ -77,14 +92,26 @@ function braceCounts(line: string) {
 }
 
 function integerOption(line: string, name: string): number | undefined {
-  const match = line.match(new RegExp(`(?:^|\\s)${name}=(-?\\d+)(?=\\s|$)`));
+  const pattern = INTEGER_OPTION_PATTERNS[name];
+  if (!pattern) return undefined;
+  const match = line.match(pattern);
   if (!match) return undefined;
   const value = Number(match[1]);
   return Number.isSafeInteger(value) ? value : undefined;
 }
 
+function signed32Option(line: string, name: string): number | undefined {
+  const value = integerOption(line, name);
+  return value !== undefined &&
+    value >= -2_147_483_648 &&
+    value <= 2_147_483_647
+    ? value
+    : undefined;
+}
+
 function stringOption(line: string, name: string, fallback: string): string {
-  const match = line.match(new RegExp(`(?:^|\\s)${name}=([\\w-]+)(?=\\s|$)`));
+  const pattern = STRING_OPTION_PATTERNS[name];
+  const match = pattern ? line.match(pattern) : null;
   return match?.[1] ?? fallback;
 }
 
@@ -97,6 +124,7 @@ function actionKey(action: MacroVisualAction): string {
     action.fromX ?? "?",
     action.fromY ?? "?",
     action.button ?? "",
+    action.radius ?? 0,
     action.kind === "scroll" ? Math.sign(action.delta ?? 0) : "",
   ].join(":");
 }
@@ -105,11 +133,20 @@ export function buildMacroVisualization(source: string): MacroVisualization {
   const actions: MacroVisualAction[] = [];
   const blockMultipliers: number[] = [1];
   let cursor: CursorPosition | null = null;
+  let currentMode = "foreground";
   let actionCount = 0;
 
   for (const sourceLine of source.split(/\r?\n/)) {
     const line = stripComment(sourceLine).trim();
     if (!line) continue;
+
+    const nextMode = line
+      .match(/^mode\s+(foreground|background)\b/i)?.[1]
+      ?.toLowerCase();
+    if (nextMode && nextMode !== currentMode) {
+      cursor = null;
+      currentMode = nextMode;
+    }
 
     const repeat = line.match(/^repeat\s+(\d+)\s*\{/i);
     const blockHeader = /^(?:repeat\s+\d+|if\b|while\b).*\{/i.test(line);
@@ -127,15 +164,19 @@ export function buildMacroVisualization(source: string): MacroVisualization {
       const multiplier = blockMultipliers[blockMultipliers.length - 1];
       const command = line.match(/^(move|click|scroll)\b/i)?.[1]?.toLowerCase();
       if (command && multiplier > 0) {
-        const explicitX = integerOption(line, "x");
-        const explicitY = integerOption(line, "y");
+        const explicitX = signed32Option(line, "x");
+        const explicitY = signed32Option(line, "y");
+        const hasCoordinates =
+          explicitX !== undefined && explicitY !== undefined;
+        const defaultSpace =
+          command === "move" || hasCoordinates
+            ? "screen"
+            : (cursor?.space ?? "screen");
         const space = stringOption(
           line,
           "space",
-          cursor?.space ?? "screen",
+          defaultSpace,
         ) as CoordinateSpace;
-        const hasCoordinates =
-          explicitX !== undefined && explicitY !== undefined;
         const position = hasCoordinates
           ? { x: explicitX, y: explicitY, space }
           : cursor?.space === space
@@ -159,20 +200,28 @@ export function buildMacroVisualization(source: string): MacroVisualization {
           }
         } else if (command === "click") {
           const button = stringOption(line, "button", "left");
-          const clicks =
-            Math.max(1, integerOption(line, "count") ?? 1) * multiplier;
-          action = {
-            kind: "click",
-            order: ++actionCount,
-            repetitions: multiplier,
-            ...(position ? { x: position.x, y: position.y } : {}),
-            space: position?.space ?? space,
-            button,
-            count: clicks,
-          };
+          const count = integerOption(line, "count") ?? 1;
+          const radius = integerOption(line, "radius") ?? 0;
+          if (
+            count >= 1 &&
+            count <= 10_000 &&
+            radius >= 0 &&
+            radius <= 2_147_483_647
+          ) {
+            action = {
+              kind: "click",
+              order: ++actionCount,
+              repetitions: multiplier,
+              ...(position ? { x: position.x, y: position.y } : {}),
+              space: position?.space ?? space,
+              button,
+              count: count * multiplier,
+              radius,
+            };
+          }
           if (hasCoordinates) cursor = { x: explicitX, y: explicitY, space };
         } else {
-          const delta = integerOption(line, "delta") ?? 0;
+          const delta = signed32Option(line, "delta") ?? 0;
           action = {
             kind: "scroll",
             order: ++actionCount,
@@ -201,7 +250,13 @@ export function buildMacroVisualization(source: string): MacroVisualization {
 
     const { open, close } = braceCounts(line);
     if (blockHeader) {
-      for (let index = 0; index < Math.max(0, close - 1); index += 1) {
+      // Headers can contain empty inline blocks such as `repeat 3 {}` or
+      // `if ready {} else {}`. Account for each brace so their frame does not
+      // leak a loop multiplier into actions that follow the block.
+      for (let index = 1; index < open; index += 1) {
+        blockMultipliers.push(blockMultipliers[blockMultipliers.length - 1]);
+      }
+      for (let index = 0; index < close; index += 1) {
         if (blockMultipliers.length > 1) blockMultipliers.pop();
       }
     } else {
@@ -214,6 +269,10 @@ export function buildMacroVisualization(source: string): MacroVisualization {
     }
   }
 
+  actions.forEach((action, index) => {
+    action.order = index + 1;
+  });
+
   const pointsByKey = new Map<string, MacroClickPoint>();
   actions.forEach((action) => {
     if (
@@ -222,7 +281,8 @@ export function buildMacroVisualization(source: string): MacroVisualization {
       action.y === undefined
     )
       return;
-    const key = `${action.space}:${action.x}:${action.y}:${action.button}`;
+    const radius = action.radius ?? 0;
+    const key = `${action.space}:${action.x}:${action.y}:${action.button}:${radius}`;
     const point = pointsByKey.get(key);
     if (point) point.clicks += action.count ?? 1;
     else {
@@ -233,6 +293,7 @@ export function buildMacroVisualization(source: string): MacroVisualization {
         firstOrder: action.order,
         clicks: action.count ?? 1,
         button: action.button ?? "left",
+        radius,
       });
     }
   });

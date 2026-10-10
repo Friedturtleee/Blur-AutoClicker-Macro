@@ -9,7 +9,7 @@ import {
 import { indentUnit, syntaxHighlighting } from "@codemirror/language";
 import { basicSetup } from "codemirror";
 import { EditorView } from "@codemirror/view";
-import { useEffect, useRef } from "react";
+import { memo, useEffect, useRef } from "react";
 import type { MacroValidation } from "../../../macro/types";
 import { bmsHighlightStyle, bmsLanguage } from "../../../macro/bmsLanguage";
 
@@ -146,7 +146,11 @@ function toDiagnostics(
   return errors.map((error) => {
     const lineNumber = Math.max(1, Math.min(error.line, view.state.doc.lines));
     const line = view.state.doc.line(lineNumber);
-    const from = Math.min(line.from + Math.max(0, error.column - 1), line.to);
+    const codePointColumn = Math.max(0, error.column - 1);
+    const utf16Column = Array.from(line.text)
+      .slice(0, codePointColumn)
+      .join("").length;
+    const from = Math.min(line.from + utf16Column, line.to);
     return {
       from,
       to: Math.min(from + 1, line.to),
@@ -156,7 +160,11 @@ function toDiagnostics(
   });
 }
 
-export default function MacroCodeEditor({ value, errors, onChange }: Props) {
+const MacroCodeEditor = memo(function MacroCodeEditor({
+  value,
+  errors,
+  onChange,
+}: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const initialValueRef = useRef(value);
@@ -243,14 +251,19 @@ export default function MacroCodeEditor({ value, errors, onChange }: Props) {
 
   useEffect(() => {
     onChangeRef.current = onChange;
-    errorsRef.current = errors;
     const view = viewRef.current;
     if (!view || view.state.doc.toString() === value) return;
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: value },
     });
+  }, [onChange, value]);
+
+  useEffect(() => {
+    errorsRef.current = errors;
     if (viewRef.current) forceLinting(viewRef.current);
-  }, [onChange, errors, value]);
+  }, [errors]);
 
   return <div className="macro-editor-codemirror" ref={parentRef} />;
-}
+});
+
+export default MacroCodeEditor;

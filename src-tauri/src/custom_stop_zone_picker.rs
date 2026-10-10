@@ -6,9 +6,9 @@ use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_MOUSEMOVE,
-    WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::engine::mouse::{current_virtual_screen_rect, VirtualScreenRect};
@@ -44,6 +44,7 @@ enum KeyboardHookDecision {
 #[derive(Default)]
 struct PickerRuntime {
     active: bool,
+    generation: u64,
     drawing_start: Option<(i32, i32)>,
     mouse_hook: HHOOK,
     keyboard_hook: HHOOK,
@@ -99,73 +100,131 @@ fn normalize_rect(start: (i32, i32), end: (i32, i32)) -> StopZoneRect {
 pub fn start_custom_stop_zone_pick_inner(app: AppHandle) -> AppResult<()> {
     crate::click_point_picker::cancel_click_point_pick_inner(&app);
 
-    {
+    let generation = {
         let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
         if runtime.active {
             crate::overlay::show_custom_stop_zone_pick_overlay(&app)?;
             return Ok(());
         }
+        if !runtime.mouse_hook.is_null()
+            || !runtime.keyboard_hook.is_null()
+            || runtime.thread_id != 0
+        {
+            return Err(AppError::State(
+                "The stop-zone picker is still stopping. Try again in a moment.".into(),
+            ));
+        }
 
+        runtime.generation = runtime.generation.wrapping_add(1);
         runtime.active = true;
         runtime.drawing_start = None;
         runtime.app = Some(app.clone());
         runtime.last_preview_emit = None;
-    }
+        runtime.generation
+    };
 
     app.state::<ClickerState>()
         .custom_stop_zone_pick_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    crate::overlay::show_custom_stop_zone_pick_overlay(&app)?;
+    if let Err(error) = crate::overlay::show_custom_stop_zone_pick_overlay(&app) {
+        stop_custom_stop_zone_pick(Some(app.clone()), true);
+        return Err(error);
+    }
 
     let (ready_tx, ready_rx) = mpsc::channel();
-    std::thread::spawn(move || unsafe {
-        let thread_id = GetCurrentThreadId();
-        let mouse_hook =
-            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0);
-        if mouse_hook.is_null() {
-            let err = GetLastError();
-            let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
-            return;
-        }
+    let hook_thread = std::thread::Builder::new()
+        .name("blur-stop-zone-picker".into())
+        .spawn(move || unsafe {
+            let mut initial_message = std::mem::zeroed::<MSG>();
+            // Create the queue before publishing the thread ID so cancellation can
+            // always post WM_QUIT, including while hooks are still starting.
+            PeekMessageW(&mut initial_message, std::ptr::null_mut(), 0, 0, 0);
+            let thread_id = GetCurrentThreadId();
+            let picker_reserved = {
+                let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+                if runtime.generation != generation || !runtime.active {
+                    false
+                } else {
+                    runtime.thread_id = thread_id;
+                    true
+                }
+            };
+            if !picker_reserved {
+                let _ = ready_tx.send(Err(AppError::State(
+                    "Stop-zone picker was cancelled during startup.".into(),
+                )));
+                return;
+            }
 
-        let keyboard_hook = SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(keyboard_hook_proc),
-            std::ptr::null_mut(),
-            0,
-        );
-        if keyboard_hook.is_null() {
-            let err = GetLastError();
+            let mouse_hook =
+                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0);
+            if mouse_hook.is_null() {
+                let err = GetLastError();
+                clear_picker_thread_id(thread_id);
+                let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
+                return;
+            }
+
+            let keyboard_hook = SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_hook_proc),
+                std::ptr::null_mut(),
+                0,
+            );
+            if keyboard_hook.is_null() {
+                let err = GetLastError();
+                UnhookWindowsHookEx(mouse_hook);
+                clear_picker_thread_id(thread_id);
+                let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
+                return;
+            }
+
+            let picker_active = {
+                let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+                if runtime.generation != generation || !runtime.active {
+                    false
+                } else {
+                    runtime.mouse_hook = mouse_hook;
+                    runtime.keyboard_hook = keyboard_hook;
+                    runtime.thread_id = thread_id;
+                    true
+                }
+            };
+
+            if picker_active {
+                let _ = ready_tx.send(Ok(()));
+                let mut msg = std::mem::zeroed::<MSG>();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+            } else {
+                UnhookWindowsHookEx(mouse_hook);
+                UnhookWindowsHookEx(keyboard_hook);
+                clear_picker_thread_id(thread_id);
+                let _ = ready_tx.send(Err(AppError::State(
+                    "Stop-zone picker was cancelled during startup.".into(),
+                )));
+                return;
+            }
+
             UnhookWindowsHookEx(mouse_hook);
-            let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
-            return;
-        }
-
-        {
+            UnhookWindowsHookEx(keyboard_hook);
             let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-            runtime.mouse_hook = mouse_hook;
-            runtime.keyboard_hook = keyboard_hook;
-            runtime.thread_id = thread_id;
-        }
-        let _ = ready_tx.send(Ok(()));
-
-        let mut msg = std::mem::zeroed::<MSG>();
-        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-
-        UnhookWindowsHookEx(mouse_hook);
-        UnhookWindowsHookEx(keyboard_hook);
-        let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-        if runtime.mouse_hook == mouse_hook {
-            runtime.mouse_hook = std::ptr::null_mut();
-        }
-        if runtime.keyboard_hook == keyboard_hook {
-            runtime.keyboard_hook = std::ptr::null_mut();
-        }
-        if runtime.mouse_hook.is_null() && runtime.keyboard_hook.is_null() {
-            runtime.thread_id = 0;
-        }
-    });
+            if runtime.mouse_hook == mouse_hook {
+                runtime.mouse_hook = std::ptr::null_mut();
+            }
+            if runtime.keyboard_hook == keyboard_hook {
+                runtime.keyboard_hook = std::ptr::null_mut();
+            }
+            if runtime.mouse_hook.is_null() && runtime.keyboard_hook.is_null() {
+                runtime.thread_id = 0;
+            }
+        });
+    if let Err(error) = hook_thread {
+        stop_custom_stop_zone_pick(Some(app.clone()), true);
+        return Err(AppError::State(format!(
+            "Could not start stop-zone picker hooks: {error}"
+        )));
+    }
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(())) => Ok(()),
@@ -215,6 +274,7 @@ fn stop_custom_stop_zone_pick(
         let app = app_override.or_else(|| runtime.app.clone());
         let thread_id = runtime.thread_id;
         runtime.active = false;
+        runtime.generation = runtime.generation.wrapping_add(1);
         runtime.drawing_start = None;
         runtime.app = None;
         runtime.last_preview_emit = None;
@@ -240,22 +300,31 @@ fn stop_custom_stop_zone_pick(
     app
 }
 
+fn clear_picker_thread_id(thread_id: u32) {
+    let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+    if runtime.thread_id == thread_id {
+        runtime.thread_id = 0;
+    }
+}
+
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    }
+    let (active, drawing_start) = {
+        let runtime = picker().lock().unwrap_or_else(poisoned_inner);
+        (runtime.active, runtime.drawing_start)
+    };
+    if !active {
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
     let message = wparam as u32;
     let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
-    let drawing = picker()
-        .lock()
-        .unwrap_or_else(poisoned_inner)
-        .drawing_start
-        .is_some();
 
     if message == WM_MOUSEMOVE {
-        if should_emit_drag_preview(drawing) {
-            let start = picker().lock().unwrap_or_else(poisoned_inner).drawing_start;
+        if should_emit_drag_preview(drawing_start.is_some()) {
+            let start = drawing_start;
             if let Some(start) = start {
                 emit_preview(start, (mouse.pt.x, mouse.pt.y), false);
             }
@@ -265,7 +334,7 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
-    match classify_mouse_message(message, drawing) {
+    match classify_mouse_message(message, drawing_start.is_some()) {
         MouseHookDecision::Pass => CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam),
         MouseHookDecision::StartDrawing => {
             {
@@ -288,6 +357,9 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    }
+    if !picker().lock().unwrap_or_else(poisoned_inner).active {
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 

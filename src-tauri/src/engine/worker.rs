@@ -187,6 +187,7 @@ pub fn start_clicker_inner(app: &AppHandle) -> AppResult<ClickerStatusPayload> {
         return Err(AppError::AlreadyRunning);
     }
     state.active_job_is_macro.store(false, Ordering::SeqCst);
+    state.paused.store(false, Ordering::SeqCst);
 
     {
         *state.last_error.lock().unwrap_or_else(poisoned_inner) = None;
@@ -249,6 +250,7 @@ pub fn stop_clicker_inner(
     let state = app.state::<ClickerState>();
     let was_running = state.running.swap(false, Ordering::SeqCst);
     let was_macro = state.active_job_is_macro.swap(false, Ordering::SeqCst);
+    state.paused.store(false, Ordering::SeqCst);
     state.active_click_point_index.store(-1, Ordering::SeqCst);
     state.active_click_point_tick.store(0, Ordering::SeqCst);
     state.zone_started_clicker.store(false, Ordering::SeqCst);
@@ -261,7 +263,9 @@ pub fn stop_clicker_inner(
             *state.stop_reason.lock().unwrap_or_else(poisoned_inner) = Some(reason);
         }
     }
-    *state.warning.lock().unwrap_or_else(poisoned_inner) = None;
+    if !was_macro {
+        *state.warning.lock().unwrap_or_else(poisoned_inner) = None;
+    }
     let payload = current_status(app);
     if was_running {
         crate::icon::set_app_icons(app);

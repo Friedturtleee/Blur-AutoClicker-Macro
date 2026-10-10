@@ -8,9 +8,10 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, HHOOK,
-    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN, WM_MOUSEMOVE,
-    WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
+    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
+    WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
+    WM_SYSKEYDOWN,
 };
 
 use crate::engine::mouse::{current_virtual_screen_rect, VirtualScreenRect};
@@ -60,6 +61,7 @@ enum PickerPurpose {
 #[derive(Default)]
 struct PickerRuntime {
     active: bool,
+    generation: u64,
     mouse_hook: HHOOK,
     keyboard_hook: HHOOK,
     thread_id: u32,
@@ -109,9 +111,14 @@ pub fn start_macro_coordinate_pick_inner(app: AppHandle) -> AppResult<()> {
 fn start_coordinate_picker(app: AppHandle, purpose: PickerPurpose) -> AppResult<()> {
     crate::custom_stop_zone_picker::cancel_custom_stop_zone_pick_inner(&app);
 
-    {
+    let generation = {
         let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
         if runtime.active {
+            if runtime.purpose != purpose {
+                return Err(AppError::State(
+                    "Another coordinate picker is already active.".into(),
+                ));
+            }
             match runtime.purpose {
                 PickerPurpose::ClickPoints => crate::overlay::show_click_point_pick_overlay(&app)?,
                 PickerPurpose::MacroCoordinate => {
@@ -120,73 +127,130 @@ fn start_coordinate_picker(app: AppHandle, purpose: PickerPurpose) -> AppResult<
             }
             return Ok(());
         }
+        if !runtime.mouse_hook.is_null()
+            || !runtime.keyboard_hook.is_null()
+            || runtime.thread_id != 0
+        {
+            return Err(AppError::State(
+                "The coordinate picker is still stopping. Try again in a moment.".into(),
+            ));
+        }
 
+        runtime.generation = runtime.generation.wrapping_add(1);
         runtime.active = true;
         runtime.app = Some(app.clone());
         runtime.purpose = purpose;
         runtime.last_cursor_emit = None;
         runtime.stop_after_right_up = false;
-    }
+        runtime.generation
+    };
 
     app.state::<ClickerState>()
         .click_point_pick_active
         .store(true, std::sync::atomic::Ordering::SeqCst);
 
-    match purpose {
-        PickerPurpose::ClickPoints => crate::overlay::show_click_point_pick_overlay(&app)?,
-        PickerPurpose::MacroCoordinate => {
-            crate::overlay::show_macro_coordinate_pick_overlay(&app)?
-        }
+    let overlay_result = match purpose {
+        PickerPurpose::ClickPoints => crate::overlay::show_click_point_pick_overlay(&app),
+        PickerPurpose::MacroCoordinate => crate::overlay::show_macro_coordinate_pick_overlay(&app),
+    };
+    if let Err(error) = overlay_result {
+        stop_click_point_pick(Some(app.clone()), true);
+        return Err(error);
     }
 
     let (ready_tx, ready_rx) = mpsc::channel();
-    std::thread::spawn(move || unsafe {
-        let thread_id = GetCurrentThreadId();
-        let mouse_hook =
-            SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0);
-        if mouse_hook.is_null() {
-            let err = GetLastError();
-            let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
-            return;
-        }
+    let hook_thread = std::thread::Builder::new()
+        .name("blur-coordinate-picker".into())
+        .spawn(move || unsafe {
+            let mut initial_message = std::mem::zeroed::<MSG>();
+            // Create the queue before publishing the thread ID so cancellation can
+            // always post WM_QUIT, including while hooks are still starting.
+            PeekMessageW(&mut initial_message, std::ptr::null_mut(), 0, 0, 0);
+            let thread_id = GetCurrentThreadId();
+            let picker_reserved = {
+                let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+                if runtime.generation != generation || !runtime.active {
+                    false
+                } else {
+                    runtime.thread_id = thread_id;
+                    true
+                }
+            };
+            if !picker_reserved {
+                let _ = ready_tx.send(Err(AppError::State(
+                    "Coordinate picker was cancelled during startup.".into(),
+                )));
+                return;
+            }
 
-        let keyboard_hook = SetWindowsHookExW(
-            WH_KEYBOARD_LL,
-            Some(keyboard_hook_proc),
-            std::ptr::null_mut(),
-            0,
-        );
-        if keyboard_hook.is_null() {
-            let err = GetLastError();
+            let mouse_hook =
+                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0);
+            if mouse_hook.is_null() {
+                let err = GetLastError();
+                clear_picker_thread_id(thread_id);
+                let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
+                return;
+            }
+
+            let keyboard_hook = SetWindowsHookExW(
+                WH_KEYBOARD_LL,
+                Some(keyboard_hook_proc),
+                std::ptr::null_mut(),
+                0,
+            );
+            if keyboard_hook.is_null() {
+                let err = GetLastError();
+                UnhookWindowsHookEx(mouse_hook);
+                clear_picker_thread_id(thread_id);
+                let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
+                return;
+            }
+
+            let picker_active = {
+                let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+                if runtime.generation != generation || !runtime.active {
+                    false
+                } else {
+                    runtime.mouse_hook = mouse_hook;
+                    runtime.keyboard_hook = keyboard_hook;
+                    runtime.thread_id = thread_id;
+                    true
+                }
+            };
+
+            if picker_active {
+                let _ = ready_tx.send(Ok(()));
+                let mut msg = std::mem::zeroed::<MSG>();
+                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
+            } else {
+                UnhookWindowsHookEx(mouse_hook);
+                UnhookWindowsHookEx(keyboard_hook);
+                clear_picker_thread_id(thread_id);
+                let _ = ready_tx.send(Err(AppError::State(
+                    "Coordinate picker was cancelled during startup.".into(),
+                )));
+                return;
+            }
+
             UnhookWindowsHookEx(mouse_hook);
-            let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
-            return;
-        }
-
-        {
+            UnhookWindowsHookEx(keyboard_hook);
             let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-            runtime.mouse_hook = mouse_hook;
-            runtime.keyboard_hook = keyboard_hook;
-            runtime.thread_id = thread_id;
-        }
-        let _ = ready_tx.send(Ok(()));
-
-        let mut msg = std::mem::zeroed::<MSG>();
-        while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-
-        UnhookWindowsHookEx(mouse_hook);
-        UnhookWindowsHookEx(keyboard_hook);
-        let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-        if runtime.mouse_hook == mouse_hook {
-            runtime.mouse_hook = std::ptr::null_mut();
-        }
-        if runtime.keyboard_hook == keyboard_hook {
-            runtime.keyboard_hook = std::ptr::null_mut();
-        }
-        if runtime.mouse_hook.is_null() && runtime.keyboard_hook.is_null() {
-            runtime.thread_id = 0;
-        }
-    });
+            if runtime.mouse_hook == mouse_hook {
+                runtime.mouse_hook = std::ptr::null_mut();
+            }
+            if runtime.keyboard_hook == keyboard_hook {
+                runtime.keyboard_hook = std::ptr::null_mut();
+            }
+            if runtime.mouse_hook.is_null() && runtime.keyboard_hook.is_null() {
+                runtime.thread_id = 0;
+            }
+        });
+    if let Err(error) = hook_thread {
+        stop_click_point_pick(Some(app.clone()), true);
+        return Err(AppError::State(format!(
+            "Could not start coordinate picker hooks: {error}"
+        )));
+    }
 
     match ready_rx.recv_timeout(Duration::from_secs(1)) {
         Ok(Ok(())) => Ok(()),
@@ -222,6 +286,7 @@ fn stop_click_point_pick(
         let app = app_override.or_else(|| runtime.app.clone());
         let thread_id = runtime.thread_id;
         runtime.active = false;
+        runtime.generation = runtime.generation.wrapping_add(1);
         runtime.app = None;
         runtime.last_cursor_emit = None;
         runtime.stop_after_right_up = false;
@@ -246,11 +311,18 @@ fn stop_click_point_pick(
 
     app
 }
+
+fn clear_picker_thread_id(thread_id: u32) {
+    let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+    if runtime.thread_id == thread_id {
+        runtime.thread_id = 0;
+    }
+}
+
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
-
     let message = wparam as u32;
     let mouse = &*(lparam as *const MSLLHOOKSTRUCT);
 
@@ -259,10 +331,30 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
+    let purpose = {
+        let runtime = picker().lock().unwrap_or_else(poisoned_inner);
+        if !runtime.active {
+            return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        }
+        runtime.purpose
+    };
+
     let shift_down = (GetAsyncKeyState(VK_SHIFT as i32) & 0x8000u16 as i16) != 0;
     let ctrl_down = (GetAsyncKeyState(VK_CONTROL as i32) & 0x8000u16 as i16) != 0;
 
-    match classify_mouse_message(message, shift_down, ctrl_down) {
+    let decision = if purpose == PickerPurpose::MacroCoordinate {
+        match message {
+            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => MouseHookDecision::Pick {
+                continue_picking: true,
+            },
+            WM_RBUTTONUP => MouseHookDecision::Swallow,
+            _ => MouseHookDecision::Pass,
+        }
+    } else {
+        classify_mouse_message(message, shift_down, ctrl_down)
+    };
+
+    match decision {
         MouseHookDecision::Pass => CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam),
         MouseHookDecision::Swallow => {
             if message == WM_RBUTTONUP {
@@ -294,6 +386,9 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
 }
 unsafe extern "system" fn keyboard_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    }
+    if !picker().lock().unwrap_or_else(poisoned_inner).active {
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
     }
 
@@ -359,7 +454,14 @@ fn emit_pick(x: i32, y: i32, continue_picking: bool) {
             PickerPurpose::ClickPoints => "click-point-picked",
             PickerPurpose::MacroCoordinate => "macro-coordinate-picked",
         };
-        let _ = app.emit(event_name, ClickPointPickedPayload { x, y, continue_picking });
+        let _ = app.emit(
+            event_name,
+            ClickPointPickedPayload {
+                x,
+                y,
+                continue_picking,
+            },
+        );
     }
 }
 

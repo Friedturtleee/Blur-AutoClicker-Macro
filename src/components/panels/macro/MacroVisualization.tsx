@@ -1,4 +1,6 @@
-import { useMemo } from "react";
+import { memo, useDeferredValue, useEffect, useMemo, useState } from "react";
+import { createPortal } from "react-dom";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   buildMacroVisualization,
   type MacroVisualAction,
@@ -7,6 +9,9 @@ import {
 interface Props {
   source: string;
 }
+
+const ACTION_PAGE_SIZE = 50;
+const MAP_MARKER_LIMIT = 500;
 
 function actionLabel(action: MacroVisualAction) {
   const coordinates =
@@ -19,52 +24,159 @@ function actionLabel(action: MacroVisualAction) {
     case "move":
       return `Move → ${coordinates}${repeats}`;
     case "click":
-      return `Click ${action.button} · ${coordinates} · ${action.count ?? 1} clicks`;
+      return `Click ${action.button} · ${coordinates} · ${action.count ?? 1} clicks${action.radius ? ` · radius ${action.radius}` : ""}`;
     case "scroll":
       return `Scroll ${action.delta === 0 ? "·" : action.delta! > 0 ? "↑" : "↓"} · ${coordinates}${repeats}`;
   }
 }
 
-export default function MacroVisualization({ source }: Props) {
+const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
+  const [actionPageState, setActionPageState] = useState({ source, page: 0 });
+  const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isTransparent, setIsTransparent] = useState(false);
+  const visualizationSource = useDeferredValue(source);
   const visualization = useMemo(
-    () => buildMacroVisualization(source),
-    [source],
+    () => buildMacroVisualization(visualizationSource),
+    [visualizationSource],
   );
-  const plottedActions = visualization.actions.filter(
+  const actionPage =
+    actionPageState.source === source ? actionPageState.page : 0;
+  const actionPageCount = Math.max(
+    1,
+    Math.ceil(visualization.actions.length / ACTION_PAGE_SIZE),
+  );
+  const currentActionPage = Math.min(actionPage, actionPageCount - 1);
+  const changeActionPage = (delta: number) => {
+    setActionPageState((current) => {
+      const page = current.source === source ? current.page : 0;
+      return {
+        source,
+        page: Math.max(0, Math.min(page + delta, actionPageCount - 1)),
+      };
+    });
+  };
+  const visibleActions = visualization.actions.slice(
+    currentActionPage * ACTION_PAGE_SIZE,
+    (currentActionPage + 1) * ACTION_PAGE_SIZE,
+  );
+  const coordinateActions = visualization.actions.filter(
     (action) => action.x !== undefined && action.y !== undefined,
   );
-  const coordinates = plottedActions.flatMap((action) => [
-    { x: action.x!, y: action.y! },
-    ...(action.fromX !== undefined && action.fromY !== undefined
-      ? [{ x: action.fromX, y: action.fromY }]
-      : []),
-  ]);
-  const minX = coordinates.length
-    ? Math.min(...coordinates.map((point) => point.x))
-    : 0;
-  const maxX = coordinates.length
-    ? Math.max(...coordinates.map((point) => point.x))
-    : 1;
-  const minY = coordinates.length
-    ? Math.min(...coordinates.map((point) => point.y))
-    : 0;
-  const maxY = coordinates.length
-    ? Math.max(...coordinates.map((point) => point.y))
-    : 1;
+  const plottedMapActions = visualization.actions.slice(0, MAP_MARKER_LIMIT);
+  const plottedClickPoints = visualization.clickPoints
+    .filter((point) => point.firstOrder <= MAP_MARKER_LIMIT)
+    .slice(0, MAP_MARKER_LIMIT);
+  const plottedActions = coordinateActions;
+  let minX = plottedActions.length ? Number.POSITIVE_INFINITY : 0;
+  let maxX = plottedActions.length ? Number.NEGATIVE_INFINITY : 1;
+  let minY = plottedActions.length ? Number.POSITIVE_INFINITY : 0;
+  let maxY = plottedActions.length ? Number.NEGATIVE_INFINITY : 1;
+  const includePoint = (x: number, y: number) => {
+    minX = Math.min(minX, x);
+    maxX = Math.max(maxX, x);
+    minY = Math.min(minY, y);
+    maxY = Math.max(maxY, y);
+  };
+  plottedActions.forEach((action) => {
+    includePoint(action.x!, action.y!);
+    if (action.fromX !== undefined && action.fromY !== undefined)
+      includePoint(action.fromX, action.fromY);
+  });
   const plot = (x: number, y: number) => ({
     x: 18 + ((x - minX) / Math.max(1, maxX - minX)) * 284,
     y: 18 + ((y - minY) / Math.max(1, maxY - minY)) * 132,
   });
+  const mapRadiusScale = Math.min(
+    maxX > minX ? 284 / (maxX - minX) : 1,
+    maxY > minY ? 132 / (maxY - minY) : 1,
+  );
+  const trajectoryPoints = coordinateActions
+    .flatMap((action) => {
+      const start =
+        action.kind === "move" &&
+        action.fromX !== undefined &&
+        action.fromY !== undefined
+          ? [plot(action.fromX, action.fromY)]
+          : [];
+      return [...start, plot(action.x!, action.y!)];
+    })
+    .map((position) => {
+      return `${position.x},${position.y}`;
+    })
+    .join(" ");
 
-  return (
-    <aside className="macro-visualization" aria-label="Macro action map">
+  const toggleFullscreen = async () => {
+    try {
+      const appWindow = getCurrentWindow();
+      await appWindow.setFullscreen(!isFullscreen);
+      setIsFullscreen((current) => !current);
+    } catch (error) {
+      console.error("Could not toggle Action Map fullscreen:", error);
+    }
+  };
+
+  useEffect(() => {
+    if (!isFullscreen) return;
+    document.documentElement.classList.add("macro-map-fullscreen");
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setIsFullscreen(false);
+      void getCurrentWindow()
+        .setFullscreen(false)
+        .catch(() => {});
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.documentElement.classList.remove("macro-map-fullscreen");
+      void getCurrentWindow()
+        .setFullscreen(false)
+        .catch(() => {});
+    };
+  }, [isFullscreen]);
+
+  const visualizationContent = (
+    <aside
+      className={
+        "macro-visualization" +
+        (isFullscreen ? " macro-visualization-fullscreen" : "") +
+        (isTransparent ? " is-transparent" : "")
+      }
+      aria-label="Macro action map"
+    >
       <div className="macro-visualization-heading">
         <strong>Action map</strong>
         <span>
           {visualization.clickPoints.length} points ·{" "}
           {visualization.actions.length} actions
         </span>
+        <button
+          type="button"
+          className="adv-secondary-btn macro-button macro-map-fullscreen-toggle"
+          onClick={() => void toggleFullscreen()}
+          aria-label={
+            isFullscreen
+              ? "Exit fullscreen action map"
+              : "Show fullscreen action map"
+          }
+          title={isFullscreen ? "Exit fullscreen (Esc)" : "Show fullscreen"}
+        >
+          {isFullscreen ? "Exit fullscreen" : "⛶ Fullscreen"}
+        </button>
       </div>
+      {isFullscreen && (
+        <div className="macro-map-display-controls">
+          <span>Full macro route · {visualization.actions.length} actions</span>
+          <button
+            type="button"
+            className="adv-secondary-btn macro-button"
+            aria-pressed={isTransparent}
+            onClick={() => setIsTransparent((current) => !current)}
+          >
+            {isTransparent ? "Transparent: On" : "Transparent: Off"}
+          </button>
+        </div>
+      )}
       <svg
         className="macro-action-map"
         viewBox="0 0 320 168"
@@ -108,7 +220,15 @@ export default function MacroVisualization({ source }: Props) {
           rx="8"
           fill="url(#macro-map-grid)"
         />
-        {visualization.actions.map((action) => {
+        {trajectoryPoints && (
+          <polyline
+            points={trajectoryPoints}
+            className="macro-map-trajectory"
+            markerMid="url(#macro-map-arrowhead)"
+            markerEnd="url(#macro-map-arrowhead)"
+          />
+        )}
+        {plottedMapActions.map((action) => {
           if (
             action.kind !== "move" ||
             action.x === undefined ||
@@ -148,15 +268,23 @@ export default function MacroVisualization({ source }: Props) {
             </g>
           );
         })}
-        {visualization.clickPoints.map((point) => {
+        {plottedClickPoints.map((point) => {
           const location = plot(point.x, point.y);
           return (
             <g
-              key={`click-${point.space}-${point.x}-${point.y}-${point.button}`}
+              key={`click-${point.space}-${point.x}-${point.y}-${point.button}-${point.radius}`}
             >
               <title>
-                {`Action ${point.firstOrder}: ${point.clicks} ${point.button} click(s) at ${point.x}, ${point.y} (${point.space})`}
+                {`Action ${point.firstOrder}: ${point.clicks} ${point.button} click(s) at ${point.x}, ${point.y} (${point.space})${point.radius ? `, random radius ${point.radius}` : ""}`}
               </title>
+              {point.radius > 0 && (
+                <circle
+                  cx={location.x}
+                  cy={location.y}
+                  r={Math.min(60, Math.max(7, point.radius * mapRadiusScale))}
+                  className="macro-map-click-radius"
+                />
+              )}
               <circle
                 cx={location.x}
                 cy={location.y}
@@ -182,7 +310,7 @@ export default function MacroVisualization({ source }: Props) {
             </g>
           );
         })}
-        {visualization.actions.map((action) => {
+        {plottedMapActions.map((action) => {
           if (
             action.kind !== "scroll" ||
             action.x === undefined ||
@@ -233,11 +361,45 @@ export default function MacroVisualization({ source }: Props) {
           </text>
         )}
       </svg>
+      {visualization.actions.length > MAP_MARKER_LIMIT && (
+        <span className="macro-visualization-note">
+          The route includes every coordinate action; numbered markers show the
+          first {MAP_MARKER_LIMIT}.
+        </span>
+      )}
+      {visualization.actions.length > ACTION_PAGE_SIZE && (
+        <div className="macro-visualization-pagination">
+          <span>
+            Actions {currentActionPage * ACTION_PAGE_SIZE + 1}–
+            {Math.min(
+              (currentActionPage + 1) * ACTION_PAGE_SIZE,
+              visualization.actions.length,
+            )}{" "}
+            of {visualization.actions.length}
+          </span>
+          <button
+            type="button"
+            className="adv-secondary-btn macro-button"
+            disabled={currentActionPage === 0}
+            onClick={() => changeActionPage(-1)}
+          >
+            Previous
+          </button>
+          <button
+            type="button"
+            className="adv-secondary-btn macro-button"
+            disabled={currentActionPage >= actionPageCount - 1}
+            onClick={() => changeActionPage(1)}
+          >
+            Next
+          </button>
+        </div>
+      )}
       <ol
         className="macro-visualization-list"
         aria-label="Ordered macro actions"
       >
-        {visualization.actions.map((action) => (
+        {visibleActions.map((action) => (
           <li key={`${action.kind}-${action.order}`}>
             <span
               className={`macro-action-icon macro-action-icon--${action.kind}`}
@@ -267,4 +429,10 @@ export default function MacroVisualization({ source }: Props) {
       </ol>
     </aside>
   );
-}
+
+  return isFullscreen
+    ? createPortal(visualizationContent, document.body)
+    : visualizationContent;
+});
+
+export default MacroVisualization;

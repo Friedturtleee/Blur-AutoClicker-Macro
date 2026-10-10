@@ -353,6 +353,9 @@ const SETTINGS_ONLY_FIELDS = {
   recordingHotkey: {
     default: "ctrl+shift+r",
   },
+  macroHotkeyOverride: {
+    default: false,
+  },
   emergencyStopHotkey: {
     default: "ctrl+shift+f12",
   },

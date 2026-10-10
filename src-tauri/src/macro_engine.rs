@@ -4,6 +4,8 @@ use tauri::Manager;
 const MAX_SOURCE_BYTES: usize = 1_000_000;
 const MAX_STATEMENTS: usize = 50_000;
 const MAX_BLOCK_DEPTH: usize = 32;
+const MAX_EXPRESSION_NESTING: usize = 32;
+const MAX_EXPRESSION_NODES: usize = 256;
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -338,7 +340,7 @@ pub(crate) struct TargetSelector {
     pub class_name: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExecutionMode {
     Foreground,
     Background,
@@ -411,6 +413,8 @@ struct Parser {
     tokens: Vec<Token>,
     cursor: usize,
     statement_count: usize,
+    expression_nesting: usize,
+    expression_nodes: usize,
 }
 
 impl Parser {
@@ -419,6 +423,8 @@ impl Parser {
             tokens,
             cursor: 0,
             statement_count: 0,
+            expression_nesting: 0,
+            expression_nodes: 0,
         }
     }
 
@@ -536,6 +542,12 @@ impl Parser {
 
     fn parse_block(&mut self, depth: usize) -> Result<Vec<Statement>, MacroDiagnostic> {
         self.expect(TokenKind::LBrace, "Expected { to start block")?;
+        if !self.at(&TokenKind::Newline) && !self.at(&TokenKind::RBrace) {
+            return Err(diagnostic(
+                self.current(),
+                "Expected a newline or empty block after {",
+            ));
+        }
         self.skip_newlines();
         self.parse_statements(true, depth + 1)
     }
@@ -612,13 +624,27 @@ impl Parser {
                         "click x and y must be provided together",
                     ));
                 }
+                let count = option_u32(&values, "count", 1)?;
+                if count == 0 || count > 10_000 {
+                    return Err(diagnostic(
+                        self.current(),
+                        "click count must be from 1 to 10000",
+                    ));
+                }
+                let radius = option_u32(&values, "radius", 0)?;
+                if radius > i32::MAX as u32 {
+                    return Err(diagnostic(
+                        self.current(),
+                        "click radius must fit a signed 32-bit coordinate range",
+                    ));
+                }
                 Ok(Statement::Click {
                     button: option_button(&values)?,
                     x,
                     y,
                     space: option_space(&values, CoordinateSpace::Screen)?,
-                    count: option_u32(&values, "count", 1)?,
-                    radius: option_u32(&values, "radius", 0)?,
+                    count,
+                    radius,
                 })
             }
             "mouse_down" | "mouse_up" => {
@@ -641,6 +667,34 @@ impl Parser {
                         self.current(),
                         "Unexpected extra command argument",
                     ));
+                }
+                match command.as_str() {
+                    "key_down" | "key_up" => {
+                        key_code(&value).map_err(|error| diagnostic(self.current(), error))?;
+                    }
+                    "press" => {
+                        let keys = value
+                            .split('+')
+                            .map(str::trim)
+                            .filter(|key| !key.is_empty())
+                            .collect::<Vec<_>>();
+                        if keys.is_empty() {
+                            return Err(diagnostic(
+                                self.current(),
+                                "press requires at least one key",
+                            ));
+                        }
+                        for key in keys {
+                            key_code(key).map_err(|error| diagnostic(self.current(), error))?;
+                        }
+                    }
+                    "type" if value.encode_utf16().count() > 10_000 => {
+                        return Err(diagnostic(
+                            self.current(),
+                            "type text is limited to 10000 UTF-16 code units per statement",
+                        ));
+                    }
+                    _ => {}
                 }
                 match command.as_str() {
                     "key_down" => Ok(Statement::KeyDown(value)),
@@ -691,7 +745,7 @@ impl Parser {
             }
             "repeat" => {
                 let count = self.expect_number("repeat requires an integer count")?;
-                if count < 0 || count > 1_000_000 {
+                if !(0..=1_000_000).contains(&count) {
                     return Err(diagnostic(
                         self.current(),
                         "repeat count must be from 0 to 1000000",
@@ -780,7 +834,32 @@ impl Parser {
     }
 
     fn parse_expression(&mut self) -> Result<Expr, MacroDiagnostic> {
-        self.parse_comparison()
+        // One parser frame belongs to the top-level expression. The remaining
+        // allowed frames represent actual parenthesized nesting.
+        if self.expression_nesting > MAX_EXPRESSION_NESTING {
+            return Err(diagnostic(
+                self.current(),
+                format!("Expression nesting exceeds the {MAX_EXPRESSION_NESTING}-level limit"),
+            ));
+        }
+        if self.expression_nesting == 0 {
+            self.expression_nodes = 0;
+        }
+        self.expression_nesting += 1;
+        let result = self.parse_comparison();
+        self.expression_nesting -= 1;
+        result
+    }
+
+    fn count_expression_node(&mut self, token: &Token) -> Result<(), MacroDiagnostic> {
+        self.expression_nodes += 1;
+        if self.expression_nodes > MAX_EXPRESSION_NODES {
+            return Err(diagnostic(
+                token,
+                format!("Expression exceeds the {MAX_EXPRESSION_NODES}-node limit"),
+            ));
+        }
+        Ok(())
     }
 
     fn parse_comparison(&mut self) -> Result<Expr, MacroDiagnostic> {
@@ -795,7 +874,9 @@ impl Parser {
             _ => None,
         };
         if let Some(op) = op {
+            let operator = self.current().clone();
             self.advance();
+            self.count_expression_node(&operator)?;
             let right = self.parse_additive()?;
             Ok(Expr::Compare(op, Box::new(left), Box::new(right)))
         } else {
@@ -810,7 +891,9 @@ impl Parser {
             if !add && !self.at(&TokenKind::Minus) {
                 break;
             }
+            let operator = self.current().clone();
             self.advance();
+            self.count_expression_node(&operator)?;
             let right = self.parse_primary()?;
             expr = if add {
                 Expr::Add(Box::new(expr), Box::new(right))
@@ -1027,20 +1110,7 @@ fn parse_program(source: &str) -> Result<(Program, usize), MacroDiagnostic> {
 
 pub fn validate_source(source: &str) -> MacroValidation {
     match parse_program(source) {
-        Ok((program, statement_count)) => {
-            let mut errors = Vec::new();
-            validate_mode(
-                &program.statements,
-                ExecutionMode::Foreground,
-                false,
-                &mut errors,
-            );
-            MacroValidation {
-                ok: errors.is_empty(),
-                errors,
-                statement_count,
-            }
-        }
+        Ok((program, statement_count)) => validate_program(&program, statement_count),
         Err(error) => MacroValidation {
             ok: false,
             errors: vec![error],
@@ -1049,61 +1119,160 @@ pub fn validate_source(source: &str) -> MacroValidation {
     }
 }
 
+fn validate_program(program: &Program, statement_count: usize) -> MacroValidation {
+    let mut errors = Vec::new();
+    validate_mode(
+        &program.statements,
+        ExecutionMode::Foreground,
+        false,
+        &mut errors,
+    );
+    MacroValidation {
+        ok: errors.is_empty(),
+        errors,
+        statement_count,
+    }
+}
+
 fn validate_mode(
     statements: &[Statement],
-    mut mode: ExecutionMode,
-    mut has_target: bool,
+    mode: ExecutionMode,
+    has_target: bool,
     errors: &mut Vec<MacroDiagnostic>,
 ) {
+    let initial = ValidationState { mode, has_target };
+    let _ = validate_statements(statements, vec![initial], errors);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ValidationState {
+    mode: ExecutionMode,
+    has_target: bool,
+}
+
+fn add_validation_error(errors: &mut Vec<MacroDiagnostic>, message: &str) {
+    if errors.iter().any(|error| error.message == message) {
+        return;
+    }
+    errors.push(MacroDiagnostic {
+        line: 1,
+        column: 1,
+        message: message.into(),
+    });
+}
+
+fn merge_validation_states(
+    mut states: Vec<ValidationState>,
+    additions: Vec<ValidationState>,
+) -> Vec<ValidationState> {
+    for state in additions {
+        if !states.contains(&state) {
+            states.push(state);
+        }
+    }
+    states
+}
+
+fn validate_statements(
+    statements: &[Statement],
+    mut states: Vec<ValidationState>,
+    errors: &mut Vec<MacroDiagnostic>,
+) -> Vec<ValidationState> {
     for statement in statements {
         match statement {
-            Statement::Target(_) => has_target = true,
-            Statement::Mode { mode: next, strict } => {
-                mode = *next;
-                if mode == ExecutionMode::Background && !strict {
-                    errors.push(MacroDiagnostic {
-                        line: 1,
-                        column: 1,
-                        message: "Background mode requires strict=true".into(),
-                    });
+            Statement::Target(_) => {
+                for state in &mut states {
+                    state.has_target = true;
                 }
             }
-            Statement::Click { .. } | Statement::Move { .. } | Statement::Scroll { .. }
-                if mode == ExecutionMode::Background && !has_target =>
-            {
-                errors.push(MacroDiagnostic {
-                    line: 1,
-                    column: 1,
-                    message: "Background input requires a target selector before the action".into(),
-                });
+            Statement::Mode { mode: next, strict } => {
+                if *next == ExecutionMode::Background && !strict {
+                    add_validation_error(errors, "Background mode requires strict=true");
+                }
+                for state in &mut states {
+                    state.mode = *next;
+                }
+            }
+            Statement::Click { .. } | Statement::Move { .. } | Statement::Scroll { .. } => {
+                if states
+                    .iter()
+                    .any(|state| state.mode == ExecutionMode::Background && !state.has_target)
+                {
+                    add_validation_error(
+                        errors,
+                        "Background input requires a target selector before the action",
+                    );
+                }
+                if states.iter().any(|state| {
+                    state.mode == ExecutionMode::Background
+                        && matches!(statement, Statement::Scroll { .. })
+                }) {
+                    add_validation_error(
+                        errors,
+                        "This action is unsupported in strict background mode; no foreground fallback is performed",
+                    );
+                }
             }
             Statement::MouseDown(_)
             | Statement::MouseUp(_)
             | Statement::KeyDown(_)
             | Statement::KeyUp(_)
             | Statement::Press(_)
-            | Statement::Type(_)
-            | Statement::Scroll { .. }
-                if mode == ExecutionMode::Background =>
-            {
-                errors.push(MacroDiagnostic {
-                    line: 1,
-                    column: 1,
-                    message: "This action is unsupported in strict background mode; no foreground fallback is performed".into(),
-                });
+            | Statement::Type(_) => {
+                if states
+                    .iter()
+                    .any(|state| state.mode == ExecutionMode::Background)
+                {
+                    add_validation_error(
+                        errors,
+                        "This action is unsupported in strict background mode; no foreground fallback is performed",
+                    );
+                }
             }
-            Statement::Repeat { body, .. } | Statement::While { body, .. } => {
-                validate_mode(body, mode, has_target, errors);
+            Statement::Repeat { count, body } => {
+                if *count > 0 {
+                    let mut current = states.clone();
+                    let mut seen = Vec::<Vec<ValidationState>>::new();
+                    let mut iteration = 0u32;
+                    while iteration < *count {
+                        if let Some(cycle_start) = seen.iter().position(|prior| prior == &current) {
+                            let cycle_length = iteration - cycle_start as u32;
+                            let remainder = (*count - iteration) % cycle_length;
+                            for _ in 0..remainder {
+                                current = validate_statements(body, current, errors);
+                            }
+                            break;
+                        }
+                        seen.push(current.clone());
+                        current = validate_statements(body, current, errors);
+                        iteration += 1;
+                    }
+                    states = current;
+                }
             }
             Statement::If {
                 body, otherwise, ..
             } => {
-                validate_mode(body, mode, has_target, errors);
-                validate_mode(otherwise, mode, has_target, errors);
+                let when_true = validate_statements(body, states.clone(), errors);
+                let when_false = validate_statements(otherwise, states, errors);
+                states = merge_validation_states(when_true, when_false);
+            }
+            Statement::While { body, .. } => {
+                let mut reachable = states.clone();
+                loop {
+                    let body_outputs = validate_statements(body, reachable.clone(), errors);
+                    let expanded = merge_validation_states(reachable.clone(), body_outputs);
+                    if expanded == reachable {
+                        break;
+                    }
+                    reachable = expanded;
+                }
+                states = reachable;
             }
             _ => {}
         }
     }
+    states
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1116,19 +1285,20 @@ struct Execution {
     app: tauri::AppHandle,
     expected_generation: u64,
     selected_hwnd: Option<u64>,
+    selected_pid: Option<u32>,
     target: Option<crate::target_window::TargetWindow>,
     safety_config: crate::engine::ClickerConfig,
     mode: ExecutionMode,
     variables: std::collections::HashMap<String, Value>,
     held_buttons: std::collections::HashSet<MouseButton>,
-    held_keys: std::collections::HashMap<String, u16>,
+    held_keys: std::collections::HashSet<u16>,
     virtual_cursor: Option<(i32, i32)>,
     virtual_cursor_space: CoordinateSpace,
     random: crate::engine::rng::SmallRng,
     steps: usize,
     loop_iterations: usize,
     started: std::time::Instant,
-    last_status_step: usize,
+    last_status_emit: std::time::Duration,
 }
 
 impl Execution {
@@ -1151,15 +1321,25 @@ impl Execution {
         if self.started.elapsed() > std::time::Duration::from_secs(15 * 60) {
             return Err("Stopped by the 15-minute macro runtime limit.".into());
         }
-        if self.steps >= MAX_STATEMENTS {
-            return Err(format!(
-                "Stopped by the {MAX_STATEMENTS}-step execution limit."
-            ));
-        }
         Ok(())
     }
 
+    fn is_paused(&self) -> bool {
+        use std::sync::atomic::Ordering;
+        let state = self.app.state::<crate::ClickerState>();
+        state.paused.load(Ordering::SeqCst)
+    }
+
     fn check_input_policy(&self, proposed_position: Option<(i32, i32)>) -> Result<(), String> {
+        self.check_input_policy_with_monitors(proposed_position, None)
+    }
+
+    fn check_input_policy_with_monitors(
+        &self,
+        proposed_position: Option<(i32, i32)>,
+        monitor_snapshot: Option<&[crate::engine::mouse::VirtualScreenRect]>,
+    ) -> Result<(), String> {
+        self.wait_until_resumed()?;
         self.check_limits()?;
         if self.mode == ExecutionMode::Foreground {
             if crate::engine::process::check_process_list(&self.safety_config).is_some() {
@@ -1167,22 +1347,39 @@ impl Execution {
                     "The foreground process is blocked by the configured process list.".into(),
                 );
             }
-            if let Some(reason) =
-                crate::engine::failsafe::should_stop_for_failsafe(&self.safety_config)
-            {
-                return Err(reason);
-            }
-            if let Some(position) = proposed_position {
-                if let Some(reason) =
-                    crate::engine::mouse::current_monitor_rects().and_then(|monitors| {
-                        crate::engine::failsafe::detect_failsafe(
-                            position,
-                            &monitors,
-                            &self.safety_config,
-                        )
-                    })
+            let check_failsafes = self.safety_config.stop_zones_enabled
+                || self.safety_config.corner_stop_enabled
+                || self.safety_config.edge_stop_enabled;
+            if check_failsafes {
+                let monitors = if self.safety_config.corner_stop_enabled
+                    || self.safety_config.edge_stop_enabled
                 {
-                    return Err(reason);
+                    Some(match monitor_snapshot {
+                        Some(monitors) => std::borrow::Cow::Borrowed(monitors),
+                        None => std::borrow::Cow::Owned(
+                            crate::engine::mouse::current_monitor_rects().unwrap_or_default(),
+                        ),
+                    })
+                } else {
+                    None
+                };
+                if let Some(cursor) = crate::engine::mouse::current_cursor_position() {
+                    if let Some(reason) = crate::engine::failsafe::detect_failsafe(
+                        cursor,
+                        monitors.as_deref().unwrap_or(&[]),
+                        &self.safety_config,
+                    ) {
+                        return Err(reason);
+                    }
+                }
+                if let Some(position) = proposed_position {
+                    if let Some(reason) = crate::engine::failsafe::detect_failsafe(
+                        position,
+                        monitors.as_deref().unwrap_or(&[]),
+                        &self.safety_config,
+                    ) {
+                        return Err(reason);
+                    }
                 }
             }
         } else if self.safety_config.process_list_enabled {
@@ -1210,16 +1407,50 @@ impl Execution {
     }
 
     fn wait(&self, duration_ms: u64) -> Result<(), String> {
-        let end = std::time::Instant::now() + std::time::Duration::from_millis(duration_ms);
-        while std::time::Instant::now() < end {
+        let mut remaining = std::time::Duration::from_millis(duration_ms);
+        while !remaining.is_zero() {
             self.check_limits()?;
-            let state = self.app.state::<crate::ClickerState>();
-            if state.paused.load(std::sync::atomic::Ordering::SeqCst) {
+            if self.is_paused() {
                 std::thread::sleep(std::time::Duration::from_millis(10));
                 continue;
             }
-            let left = end.saturating_duration_since(std::time::Instant::now());
-            std::thread::sleep(left.min(std::time::Duration::from_millis(10)));
+            let slice = remaining.min(std::time::Duration::from_millis(10));
+            let slice_started = std::time::Instant::now();
+            std::thread::sleep(slice);
+            // Scheduler delays must not shorten scripted waits. If pause was
+            // requested during this slice, discard it so paused time is never
+            // charged against the remaining duration.
+            if !self.is_paused() {
+                remaining = remaining.saturating_sub(slice_started.elapsed().min(slice));
+            }
+        }
+        Ok(())
+    }
+
+    fn wait_until_resumed(&self) -> Result<(), String> {
+        loop {
+            self.check_limits()?;
+            if !self.is_paused() {
+                return Ok(());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    }
+
+    fn ensure_action_supported_in_mode(&self, statement: &Statement) -> Result<(), String> {
+        if self.mode == ExecutionMode::Background
+            && matches!(
+                statement,
+                Statement::MouseDown(_)
+                    | Statement::MouseUp(_)
+                    | Statement::KeyDown(_)
+                    | Statement::KeyUp(_)
+                    | Statement::Press(_)
+                    | Statement::Type(_)
+                    | Statement::Scroll { .. }
+            )
+        {
+            return Err("This action is unsupported in strict background mode; no foreground fallback is performed.".into());
         }
         Ok(())
     }
@@ -1227,8 +1458,11 @@ impl Execution {
     fn emit_step(&mut self, command: &str) {
         use tauri::Emitter;
         self.steps += 1;
-        if self.steps == self.last_status_step || self.steps % 1 == 0 {
-            self.last_status_step = self.steps;
+        if self.steps == 1
+            || self.started.elapsed().saturating_sub(self.last_status_emit)
+                >= std::time::Duration::from_millis(100)
+        {
+            self.last_status_emit = self.started.elapsed();
             let _ = self.app.emit(
                 "macro:step",
                 serde_json::json!({
@@ -1285,9 +1519,7 @@ impl Execution {
                 Ok(Value::Boolean(matched))
             }
             Expr::WindowExists { process } => {
-                let found = crate::target_window::list_target_windows()
-                    .iter()
-                    .any(|window| window.process_name.eq_ignore_ascii_case(process));
+                let found = crate::target_window::target_process_window_exists(process);
                 Ok(Value::Boolean(found))
             }
         }
@@ -1302,7 +1534,36 @@ impl Execution {
 
     fn resolve_target(&mut self, selector: &TargetSelector) -> Result<(), String> {
         let target = crate::target_window::resolve_target(selector, self.selected_hwnd)?;
+        if self.selected_hwnd == Some(target.hwnd)
+            && self.selected_pid.is_some_and(|pid| pid != target.pid)
+        {
+            return Err(
+                "The selected window identity changed. Pick the target window again.".into(),
+            );
+        }
         self.target = Some(target);
+        Ok(())
+    }
+
+    fn resolve_selected_target_if_needed(&mut self) -> Result<(), String> {
+        let hwnd = match self.target.as_ref() {
+            Some(target) => target.hwnd,
+            None => self.selected_hwnd.ok_or_else(|| {
+                "Client coordinates require a selected target window.".to_string()
+            })?,
+        };
+        let current = crate::target_window::resolve_selected_target(hwnd)?;
+        let identity_changed = self.target.as_ref().is_some_and(|target| {
+            target.pid != current.pid
+                || !target
+                    .process_name
+                    .eq_ignore_ascii_case(&current.process_name)
+        }) || (self.selected_hwnd == Some(current.hwnd)
+            && self.selected_pid.is_some_and(|pid| pid != current.pid));
+        if identity_changed {
+            return Err("Target window identity changed; pick it again.".into());
+        }
+        self.target = Some(current);
         Ok(())
     }
 
@@ -1323,10 +1584,16 @@ impl Execution {
         Ok(current)
     }
 
-    fn to_screen(&self, x: i32, y: i32, space: CoordinateSpace) -> Result<(i32, i32), String> {
+    fn screen_coordinates(
+        &mut self,
+        x: i32,
+        y: i32,
+        space: CoordinateSpace,
+    ) -> Result<(i32, i32), String> {
         match space {
             CoordinateSpace::Screen => Ok((x, y)),
             CoordinateSpace::Client => {
+                self.resolve_selected_target_if_needed()?;
                 let target = self.target.as_ref().ok_or_else(|| {
                     "Client coordinates require a selected target window.".to_string()
                 })?;
@@ -1336,32 +1603,97 @@ impl Execution {
     }
 
     fn move_foreground(
-        &self,
+        &mut self,
         x: i32,
         y: i32,
         space: CoordinateSpace,
         duration_ms: u64,
     ) -> Result<(), String> {
-        let (x, y) = self.to_screen(x, y, space)?;
+        self.wait_until_resumed()?;
+        let (x, y) = self.screen_coordinates(x, y, space)?;
         let start = crate::engine::mouse::current_cursor_position().unwrap_or((x, y));
-        let steps = ((duration_ms / 8).clamp(1, 100)) as u64;
+        let steps = (duration_ms.saturating_add(7) / 8).clamp(1, 100);
+        let mut elapsed_ms = 0u64;
         for step in 1..=steps {
             self.check_limits()?;
+            let target_elapsed_ms =
+                (u128::from(duration_ms) * u128::from(step) / u128::from(steps)) as u64;
+            self.wait(target_elapsed_ms.saturating_sub(elapsed_ms))?;
+            elapsed_ms = target_elapsed_ms;
             let fraction = step as f64 / steps as f64;
-            let next_x = start.0 + ((x - start.0) as f64 * fraction).round() as i32;
-            let next_y = start.1 + ((y - start.1) as f64 * fraction).round() as i32;
-            self.check_input_policy(Some((next_x, next_y)))?;
-            crate::engine::mouse::move_mouse(next_x, next_y);
-            if duration_ms > 0 && step < steps {
-                self.wait((duration_ms / steps).max(1))?;
+            let next_x = (f64::from(start.0) + (f64::from(x) - f64::from(start.0)) * fraction)
+                .round() as i32;
+            let next_y = (f64::from(start.1) + (f64::from(y) - f64::from(start.1)) * fraction)
+                .round() as i32;
+            let monitors = crate::engine::mouse::current_monitor_rects().unwrap_or_default();
+            if !monitors.is_empty() && !monitors.iter().any(|monitor| monitor.contains(x, y)) {
+                return Err("Foreground coordinates must lie on a connected monitor.".into());
             }
+            self.check_input_policy_with_monitors(Some((next_x, next_y)), Some(&monitors))?;
+            crate::engine::mouse::try_move_mouse(next_x, next_y)?;
+        }
+        Ok(())
+    }
+
+    fn move_background(
+        &mut self,
+        x: i32,
+        y: i32,
+        space: CoordinateSpace,
+        duration_ms: u64,
+    ) -> Result<(), String> {
+        let start = self
+            .virtual_cursor
+            .filter(|_| self.virtual_cursor_space == space);
+        let steps = if duration_ms == 0 || start.is_none() {
+            1
+        } else {
+            (duration_ms.saturating_add(7) / 8).clamp(1, 100)
+        };
+        let mut elapsed_ms = 0u64;
+        for step in 1..=steps {
+            let target_elapsed_ms =
+                (u128::from(duration_ms) * u128::from(step) / u128::from(steps)) as u64;
+            self.wait(target_elapsed_ms.saturating_sub(elapsed_ms))?;
+            elapsed_ms = target_elapsed_ms;
+            self.check_input_policy(None)?;
+            let position = if let Some((start_x, start_y)) = start {
+                let fraction = step as f64 / steps as f64;
+                (
+                    (f64::from(start_x) + (f64::from(x) - f64::from(start_x)) * fraction).round()
+                        as i32,
+                    (f64::from(start_y) + (f64::from(y) - f64::from(start_y)) * fraction).round()
+                        as i32,
+                )
+            } else {
+                (x, y)
+            };
+            let target = self.ensure_background_target()?;
+            crate::target_window::background_move(
+                &target,
+                position.0,
+                position.1,
+                if space == CoordinateSpace::Screen {
+                    "screen"
+                } else {
+                    "client"
+                },
+            )?;
+            self.virtual_cursor = Some(position);
+            self.virtual_cursor_space = space;
         }
         Ok(())
     }
 
     fn execute(&mut self, statements: &[Statement]) -> Result<(), String> {
         for statement in statements {
-            self.check_limits()?;
+            self.wait_until_resumed()?;
+            if self.steps >= MAX_STATEMENTS {
+                return Err(format!(
+                    "Stopped by the {MAX_STATEMENTS}-step execution limit."
+                ));
+            }
+            self.ensure_action_supported_in_mode(statement)?;
             let command = match statement {
                 Statement::Target(_) => "target",
                 Statement::Mode { .. } => "mode",
@@ -1389,10 +1721,17 @@ impl Execution {
                     if *mode == ExecutionMode::Background && !strict {
                         return Err("Background mode requires strict=true.".into());
                     }
-                    if *mode == ExecutionMode::Background && self.mode != ExecutionMode::Background
-                    {
-                        // Do not seed the background virtual cursor from the real pointer.
+                    if *mode != self.mode {
+                        if !self.held_buttons.is_empty() || !self.held_keys.is_empty() {
+                            return Err(
+                                "Cannot change execution mode while mouse buttons or keys are held."
+                                    .into(),
+                            );
+                        }
+                        // A cursor position belongs to its execution mode; do not turn a
+                        // background virtual position into a real foreground click.
                         self.virtual_cursor = None;
+                        self.virtual_cursor_space = CoordinateSpace::Screen;
                     }
                     self.mode = *mode;
                 }
@@ -1403,24 +1742,11 @@ impl Execution {
                     duration_ms,
                 } => {
                     if self.mode == ExecutionMode::Background {
-                        let target = self.ensure_background_target()?;
-                        self.check_input_policy(None)?;
-                        crate::target_window::background_move(
-                            &target,
-                            *x,
-                            *y,
-                            if *space == CoordinateSpace::Screen {
-                                "screen"
-                            } else {
-                                "client"
-                            },
-                        )?;
-                        self.virtual_cursor = Some((*x, *y));
-                        self.virtual_cursor_space = *space;
+                        self.move_background(*x, *y, *space, *duration_ms)?;
                     } else {
                         self.move_foreground(*x, *y, *space, *duration_ms)?;
-                        self.virtual_cursor = Some(self.to_screen(*x, *y, *space)?);
-                        self.virtual_cursor_space = CoordinateSpace::Screen;
+                        self.virtual_cursor = Some((*x, *y));
+                        self.virtual_cursor_space = *space;
                     }
                 }
                 Statement::Click {
@@ -1433,6 +1759,11 @@ impl Execution {
                 } => {
                     if *count == 0 || *count > 10_000 {
                         return Err("click count must be from 1 to 10000.".into());
+                    }
+                    if *radius > i32::MAX as u32 {
+                        return Err(
+                            "click radius must fit a signed 32-bit coordinate range.".into()
+                        );
                     }
                     let (origin, click_space) = match (x, y) {
                         (Some(x), Some(y)) => ((*x, *y), *space),
@@ -1451,84 +1782,106 @@ impl Execution {
                             )
                         }
                     };
-                    if self.mode == ExecutionMode::Background {
-                        let target = self.ensure_background_target()?;
-                        self.check_input_policy(None)?;
-                        crate::target_window::background_click(
-                            &target,
-                            origin.0,
-                            origin.1,
-                            if click_space == CoordinateSpace::Screen {
-                                "screen"
-                            } else {
-                                "client"
-                            },
-                            button_name(button),
-                            *count,
-                        )?;
-                    } else {
-                        let (down, up) = mouse_flags(button);
-                        for _ in 0..*count {
-                            self.check_limits()?;
-                            let offset = if *radius == 0 {
-                                (0, 0)
-                            } else {
-                                let angle = self.random.next_f64() * std::f64::consts::TAU;
-                                let distance = self.random.next_f64().sqrt() * *radius as f64;
-                                (
-                                    (angle.cos() * distance).round() as i32,
-                                    (angle.sin() * distance).round() as i32,
-                                )
-                            };
-                            let point = (origin.0 + offset.0, origin.1 + offset.1);
+                    let (down, up) = mouse_flags(button);
+                    for _ in 0..*count {
+                        self.check_limits()?;
+                        let offset = if *radius == 0 {
+                            (0, 0)
+                        } else {
+                            let angle = self.random.next_f64() * std::f64::consts::TAU;
+                            let distance = self.random.next_f64().sqrt() * *radius as f64;
+                            (
+                                (angle.cos() * distance).round() as i32,
+                                (angle.sin() * distance).round() as i32,
+                            )
+                        };
+                        let point = (
+                            origin
+                                .0
+                                .checked_add(offset.0)
+                                .ok_or_else(|| "click x coordinate overflowed.".to_string())?,
+                            origin
+                                .1
+                                .checked_add(offset.1)
+                                .ok_or_else(|| "click y coordinate overflowed.".to_string())?,
+                        );
+                        if self.mode == ExecutionMode::Background {
+                            self.check_input_policy(None)?;
+                            let target = self.ensure_background_target()?;
+                            crate::target_window::background_click(
+                                &target,
+                                point.0,
+                                point.1,
+                                if click_space == CoordinateSpace::Screen {
+                                    "screen"
+                                } else {
+                                    "client"
+                                },
+                                button_name(button),
+                                1,
+                            )?;
+                        } else {
                             self.move_foreground(point.0, point.1, click_space, 0)?;
-                            crate::engine::mouse::send_mouse_event(down);
-                            crate::engine::mouse::send_mouse_event(up);
-                            if count > &1 {
-                                self.wait(2)?;
-                            }
+                            crate::engine::mouse::try_send_mouse_event(down)?;
+                            self.held_buttons.insert(button.clone());
+                            crate::engine::mouse::try_send_mouse_event(up)?;
+                            self.held_buttons.remove(button);
+                        }
+                        self.virtual_cursor = Some(point);
+                        self.virtual_cursor_space = click_space;
+                        if *count > 1 {
+                            self.wait(2)?;
                         }
                     }
                 }
                 Statement::MouseDown(button) => {
                     self.check_input_policy(None)?;
                     let (down, _) = mouse_flags(button);
-                    crate::engine::mouse::send_mouse_event(down);
+                    crate::engine::mouse::try_send_mouse_event(down)?;
                     self.held_buttons.insert(button.clone());
                 }
                 Statement::MouseUp(button) => {
                     self.check_input_policy(None)?;
                     let (_, up) = mouse_flags(button);
-                    crate::engine::mouse::send_mouse_event(up);
+                    crate::engine::mouse::try_send_mouse_event(up)?;
                     self.held_buttons.remove(button);
                 }
                 Statement::KeyDown(key) => {
                     self.check_input_policy(None)?;
                     let vk = key_code(key)?;
-                    crate::engine::keyboard::send_key_event(vk, 0);
-                    self.held_keys.insert(key.to_uppercase(), vk);
+                    crate::engine::keyboard::try_send_key_event(vk, 0)?;
+                    self.held_keys.insert(vk);
                 }
                 Statement::KeyUp(key) => {
                     self.check_input_policy(None)?;
                     let vk = key_code(key)?;
-                    crate::engine::keyboard::send_key_event(
+                    crate::engine::keyboard::try_send_key_event(
                         vk,
                         windows_sys::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
-                    );
-                    self.held_keys.remove(&key.to_uppercase());
+                    )?;
+                    self.held_keys.remove(&vk);
                 }
                 Statement::Press(chord) => self.press(chord)?,
                 Statement::Type(text) => self.type_text(text)?,
                 Statement::Scroll { delta, x, y, space } => {
-                    self.check_input_policy(None)?;
-                    let pos = match (x, y) {
-                        (Some(x), Some(y)) => Some(self.to_screen(*x, *y, *space)?),
-                        _ => None,
+                    let position = match (x, y) {
+                        (Some(x), Some(y)) => Some((*x, *y, *space)),
+                        _ => self
+                            .virtual_cursor
+                            .map(|(x, y)| (x, y, self.virtual_cursor_space)),
                     };
-                    if let Some((x, y)) = pos {
-                        self.move_foreground(x, y, CoordinateSpace::Screen, 0)?;
+                    let screen_position = position
+                        .map(|(x, y, space)| self.screen_coordinates(x, y, space))
+                        .transpose()?;
+                    self.check_input_policy(screen_position)?;
+                    if let Some((screen_x, screen_y)) = screen_position {
+                        self.move_foreground(screen_x, screen_y, CoordinateSpace::Screen, 0)?;
+                        if let Some((x, y, space)) = position {
+                            self.virtual_cursor = Some((x, y));
+                            self.virtual_cursor_space = space;
+                        }
                     }
-                    send_scroll(*delta);
+                    send_scroll(*delta)?;
                 }
                 Statement::Wait(duration_ms) => self.wait(*duration_ms)?,
                 Statement::Let { name, value } => {
@@ -1583,6 +1936,7 @@ impl Execution {
     }
 
     fn bump_loop(&mut self) -> Result<(), String> {
+        self.wait_until_resumed()?;
         self.loop_iterations += 1;
         if self.loop_iterations > 100_000 {
             return Err("Stopped by the 100000-iteration macro watchdog.".into());
@@ -1602,21 +1956,21 @@ impl Execution {
         let mut newly_pressed = Vec::new();
         for key in &keys {
             self.check_input_policy(None)?;
-            let canonical = key.to_uppercase();
-            if self.held_keys.contains_key(&canonical) {
+            let vk = key_code(key)?;
+            if self.held_keys.contains(&vk) {
                 continue;
             }
-            let vk = key_code(key)?;
-            crate::engine::keyboard::send_key_event(vk, 0);
-            self.held_keys.insert(canonical.clone(), vk);
-            newly_pressed.push(canonical);
+            crate::engine::keyboard::try_send_key_event(vk, 0)?;
+            self.held_keys.insert(vk);
+            newly_pressed.push(vk);
         }
-        for key in newly_pressed.iter().rev() {
-            if let Some(vk) = self.held_keys.remove(key) {
-                crate::engine::keyboard::send_key_event(
-                    vk,
+        for vk in newly_pressed.iter().rev() {
+            if self.held_keys.contains(vk) {
+                crate::engine::keyboard::try_send_key_event(
+                    *vk,
                     windows_sys::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
-                );
+                )?;
+                self.held_keys.remove(vk);
             }
         }
         Ok(())
@@ -1633,23 +1987,37 @@ impl Execution {
         Ok(())
     }
 
-    fn release_all(&mut self) {
-        for button in self.held_buttons.drain() {
+    fn release_all(&mut self) -> Vec<String> {
+        let mut errors = Vec::new();
+        let buttons = self.held_buttons.iter().cloned().collect::<Vec<_>>();
+        for button in buttons {
             let (_, up) = mouse_flags(&button);
-            crate::engine::mouse::send_mouse_event(up);
+            match crate::engine::mouse::try_send_mouse_event(up) {
+                Ok(()) => {
+                    self.held_buttons.remove(&button);
+                }
+                Err(error) => errors.push(format!("mouse button release failed: {error}")),
+            }
         }
-        for (_, vk) in self.held_keys.drain() {
-            crate::engine::keyboard::send_key_event(
+        let keys = self.held_keys.iter().copied().collect::<Vec<_>>();
+        for vk in keys {
+            match crate::engine::keyboard::try_send_key_event(
                 vk,
                 windows_sys::Win32::UI::Input::KeyboardAndMouse::KEYEVENTF_KEYUP,
-            );
+            ) {
+                Ok(()) => {
+                    self.held_keys.remove(&vk);
+                }
+                Err(error) => errors.push(format!("key release failed: {error}")),
+            }
         }
+        errors
     }
 }
 
 impl Drop for Execution {
     fn drop(&mut self) {
-        self.release_all();
+        let _ = self.release_all();
     }
 }
 
@@ -1685,7 +2053,8 @@ fn key_code(key: &str) -> Result<u16, String> {
         "SHIFT" => Some(0x10),
         "LEFTSHIFT" | "LSHIFT" => Some(0xA0),
         "RIGHTSHIFT" | "RSHIFT" => Some(0xA1),
-        "WIN" | "META" => Some(0x5B),
+        "WIN" | "META" | "LEFTWIN" => Some(0x5B),
+        "RIGHTWIN" => Some(0x5C),
         "ENTER" | "RETURN" => Some(0x0D),
         "ESC" | "ESCAPE" => Some(0x1B),
         "SPACE" => Some(0x20),
@@ -1703,9 +2072,18 @@ fn key_code(key: &str) -> Result<u16, String> {
         "RIGHT" => Some(0x27),
         "CAPSLOCK" => Some(0x14),
         "NUMLOCK" => Some(0x90),
+        "SCROLLLOCK" => Some(0x91),
         "PRINTSCREEN" => Some(0x2C),
         "PAUSE" => Some(0x13),
         "BACKTICK" => Some(0xC0),
+        "APPS" => Some(0x5D),
+        "SLEEP" => Some(0x5F),
+        "MULTIPLY" => Some(0x6A),
+        "ADD" => Some(0x6B),
+        "SEPARATOR" => Some(0x6C),
+        "SUBTRACT" => Some(0x6D),
+        "DECIMAL" => Some(0x6E),
+        "DIVIDE" => Some(0x6F),
         _ => None,
     };
     if let Some(vk) = named {
@@ -1737,6 +2115,13 @@ fn key_code(key: &str) -> Result<u16, String> {
         if let Ok(number) = suffix.parse::<u16>() {
             if (1..=24).contains(&number) {
                 return Ok(0x70 + number - 1);
+            }
+        }
+    }
+    if let Some(suffix) = key.strip_prefix("NUMPAD") {
+        if let Ok(number) = suffix.parse::<u16>() {
+            if number <= 9 {
+                return Ok(0x60 + number);
             }
         }
     }
@@ -1785,7 +2170,7 @@ fn type_unicode_unit(_unit: u16) -> Result<(), String> {
 }
 
 #[cfg(windows)]
-fn send_scroll(delta: i32) {
+fn send_scroll(delta: i32) -> Result<(), String> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_MOUSE, MOUSEEVENTF_WHEEL, MOUSEINPUT,
     };
@@ -1802,34 +2187,17 @@ fn send_scroll(delta: i32) {
             },
         },
     };
-    unsafe {
-        SendInput(1, &input, std::mem::size_of::<INPUT>() as i32);
+    let accepted = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    if accepted == 1 {
+        Ok(())
+    } else {
+        Err("Windows did not accept the scroll input.".into())
     }
 }
 
 #[cfg(not(windows))]
-fn send_scroll(_delta: i32) {}
-
-fn first_target(statements: &[Statement]) -> Option<&TargetSelector> {
-    for statement in statements {
-        match statement {
-            Statement::Target(selector) => return Some(selector),
-            Statement::Repeat { body, .. } | Statement::While { body, .. } => {
-                if let Some(target) = first_target(body) {
-                    return Some(target);
-                }
-            }
-            Statement::If {
-                body, otherwise, ..
-            } => {
-                if let Some(target) = first_target(body).or_else(|| first_target(otherwise)) {
-                    return Some(target);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+fn send_scroll(_delta: i32) -> Result<(), String> {
+    Err("Scroll input is only supported on Windows.".into())
 }
 
 pub fn start_macro_inner(
@@ -1869,13 +2237,13 @@ pub fn start_macro_inner(
         crate::engine::worker::build_config(&settings)
             .map_err(|error| crate::error::AppError::State(format!("Invalid settings: {error}")))?
     };
-    let (program, _) = parse_program(&source).map_err(|error| {
+    let (program, statement_count) = parse_program(&source).map_err(|error| {
         crate::error::AppError::State(format!(
             "Line {}, column {}: {}",
             error.line, error.column, error.message
         ))
     })?;
-    let validation = validate_source(&source);
+    let validation = validate_program(&program, statement_count);
     if !validation.ok {
         let first = &validation.errors[0];
         return Err(crate::error::AppError::State(format!(
@@ -1884,27 +2252,6 @@ pub fn start_macro_inner(
         )));
     }
     let needs_background = contains_background(&program.statements);
-    let target = if let Some(hwnd) = selected_hwnd {
-        let target = crate::target_window::resolve_selected_target(hwnd)
-            .map_err(crate::error::AppError::State)?;
-        if selected_pid.is_some_and(|pid| pid != target.pid) {
-            return Err(crate::error::AppError::State(
-                "The selected window identity changed. Pick the target window again.".into(),
-            ));
-        }
-        Some(target)
-    } else if needs_background {
-        let selector = first_target(&program.statements).ok_or_else(|| {
-            crate::error::AppError::State("Background mode requires a target selector.".into())
-        })?;
-        Some(
-            crate::target_window::resolve_target(selector, None)
-                .map_err(crate::error::AppError::State)?,
-        )
-    } else {
-        None
-    };
-
     if state
         .running
         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1932,7 +2279,10 @@ pub fn start_macro_inner(
         .warning
         .lock()
         .unwrap_or_else(crate::error::poisoned_inner) = if needs_background {
-        Some("Background messages are queued, but the target effect cannot be verified.".into())
+        Some(
+            "This macro may queue background messages; Windows cannot confirm the target effect."
+                .into(),
+        )
     } else {
         None
     };
@@ -1944,30 +2294,45 @@ pub fn start_macro_inner(
         app: app.clone(),
         expected_generation,
         selected_hwnd,
-        target,
+        selected_pid,
+        target: None,
         safety_config,
         mode: ExecutionMode::Foreground,
         variables: std::collections::HashMap::new(),
         held_buttons: std::collections::HashSet::new(),
-        held_keys: std::collections::HashMap::new(),
+        held_keys: std::collections::HashSet::new(),
         virtual_cursor: None,
         virtual_cursor_space: CoordinateSpace::Screen,
         random: crate::engine::rng::SmallRng::new(),
         steps: 0,
         loop_iterations: 0,
         started: std::time::Instant::now(),
-        last_status_step: 0,
+        last_status_emit: std::time::Duration::ZERO,
     };
     let app_handle = app.clone();
     let _ = app.emit("macro:state", serde_json::json!({ "state": "Running" }));
+    let preserve_background_warning = needs_background;
     std::thread::Builder::new()
         .name("blur-macro-runtime".into())
         .spawn(move || {
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 execution.execute(&program.statements)
             }))
             .unwrap_or_else(|_| Err("Macro stopped after an internal runtime error.".into()));
-            execution.release_all();
+            let release_errors = execution.release_all();
+            if !release_errors.is_empty() {
+                let release_error = format!(
+                    "Could not release all simulated input: {}",
+                    release_errors.join(" ")
+                );
+                log::error!("{release_error}");
+                result = match result {
+                    Err(previous_error) if previous_error != "Cancelled" => {
+                        Err(format!("{previous_error} {release_error}"))
+                    }
+                    _ => Err(release_error),
+                };
+            }
             if !execution.active() {
                 return;
             }
@@ -1975,6 +2340,18 @@ pub fn start_macro_inner(
             state.running.store(false, Ordering::SeqCst);
             state.active_job_is_macro.store(false, Ordering::SeqCst);
             state.paused.store(false, Ordering::SeqCst);
+            *state
+                .warning
+                .lock()
+                .unwrap_or_else(crate::error::poisoned_inner) =
+                if preserve_background_warning {
+                    Some(
+                        "This macro may queue background messages; Windows cannot confirm the target effect."
+                            .into(),
+                    )
+                } else {
+                    None
+                };
             let cancelled = matches!(result, Err(ref error) if error == "Cancelled");
             match result {
                 Ok(()) => {
@@ -2027,9 +2404,27 @@ pub fn start_macro_inner(
             crate::engine::worker::emit_status(&app_handle);
         })
         .map_err(|error| {
+            let message = format!("Failed to start macro worker: {error}");
             state.running.store(false, Ordering::SeqCst);
             state.active_job_is_macro.store(false, Ordering::SeqCst);
-            crate::error::AppError::State(format!("Failed to start macro worker: {error}"))
+            state.paused.store(false, Ordering::SeqCst);
+            state.active_click_point_index.store(-1, Ordering::SeqCst);
+            state.active_click_point_tick.store(0, Ordering::SeqCst);
+            *state
+                .last_error
+                .lock()
+                .unwrap_or_else(crate::error::poisoned_inner) = Some(message.clone());
+            *state
+                .warning
+                .lock()
+                .unwrap_or_else(crate::error::poisoned_inner) = None;
+            let _ = app.emit(
+                "macro:state",
+                serde_json::json!({ "state": "Error", "steps": 0 }),
+            );
+            crate::icon::set_app_icons(app);
+            crate::engine::worker::emit_status(app);
+            crate::error::AppError::State(message)
         })?;
 
     Ok(payload)
@@ -2041,6 +2436,7 @@ fn contains_background(statements: &[Statement]) -> bool {
             mode: ExecutionMode::Background,
             ..
         } => true,
+        Statement::Repeat { count: 0, .. } => false,
         Statement::Repeat { body, .. } | Statement::While { body, .. } => contains_background(body),
         Statement::If {
             body, otherwise, ..
@@ -2135,6 +2531,14 @@ while i < 4 {
     }
 
     #[test]
+    fn rejects_statements_inline_with_a_block_header() {
+        let validation = validate_source("repeat 2 { click x=1 y=2 }");
+
+        assert!(!validation.ok);
+        assert!(validation.errors[0].message.contains("Expected a newline"));
+    }
+
+    #[test]
     fn rejects_unknown_commands_and_options_with_locations() {
         let unknown_command = validate_source("wait 1s\nlaunch shell");
         assert!(!unknown_command.ok);
@@ -2147,6 +2551,39 @@ while i < 4 {
     fn rejects_unbalanced_blocks_and_bad_strings() {
         assert!(!validate_source("repeat 2 {\nwait 1s").ok);
         assert!(!validate_source("log \"bad\\q\"").ok);
+    }
+
+    #[test]
+    fn rejects_expressions_that_exceed_recursion_limits() {
+        let allowed_nesting = MAX_EXPRESSION_NESTING;
+        let nested_condition = format!(
+            "if {}true{} {{\nwait 1ms\n}}",
+            "(".repeat(allowed_nesting),
+            ")".repeat(allowed_nesting)
+        );
+        assert!(validate_source(&nested_condition).ok);
+
+        let nesting = MAX_EXPRESSION_NESTING + 1;
+        let deeply_nested_condition = format!(
+            "if {}true{} {{\nwait 1ms\n}}",
+            "(".repeat(nesting),
+            ")".repeat(nesting)
+        );
+        let nesting_validation = validate_source(&deeply_nested_condition);
+        assert!(!nesting_validation.ok);
+        assert!(nesting_validation.errors[0]
+            .message
+            .contains("Expression nesting"));
+
+        let allowed_terms = vec!["1"; MAX_EXPRESSION_NODES + 1].join(" + ");
+        assert!(validate_source(&format!("let total = {allowed_terms}")).ok);
+
+        let terms = vec!["1"; MAX_EXPRESSION_NODES + 2].join(" + ");
+        let node_validation = validate_source(&format!("let total = {terms}"));
+        assert!(!node_validation.ok);
+        assert!(node_validation.errors[0]
+            .message
+            .contains("Expression exceeds"));
     }
 
     #[test]

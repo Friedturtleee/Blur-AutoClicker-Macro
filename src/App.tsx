@@ -135,7 +135,10 @@ const DEFAULT_APP_INFO: AppInfo = {
   portable: false,
 };
 
-async function syncSettingsToBackend(settings: Settings) {
+async function syncSettingsToBackend(
+  settings: Settings,
+  syncMacroContext = false,
+) {
   const backendSettings = Object.fromEntries(
     Object.entries(settings).filter(
       ([key]) =>
@@ -150,6 +153,18 @@ async function syncSettingsToBackend(settings: Settings) {
       version: BACKEND_SETTINGS_SCHEMA_VERSION,
     },
   });
+  if (syncMacroContext) {
+    const profile =
+      settings.macroProfiles.find(
+        (item) => item.id === settings.activeMacroId,
+      ) ?? settings.macroProfiles[0];
+    await invoke("macro_set_context", {
+      active: settings.macroHotkeyOverride,
+      source: profile?.source ?? "",
+      selectedHwnd: profile?.target?.hwnd ?? null,
+      selectedPid: profile?.target?.pid ?? null,
+    });
+  }
 }
 
 async function registerHotkeyCandidate(hotkey: string) {
@@ -881,7 +896,7 @@ export default function App() {
           setStatus(loadedStatus);
           setSettingsLoaded(true);
 
-          await syncSettingsToBackend(hydratedSettings);
+          await syncSettingsToBackend(hydratedSettings, true);
 
           if (
             macroMigration.changed ||
@@ -1869,7 +1884,7 @@ export default function App() {
             primaryHotkey={settings.hotkey}
             onRun={async (source, targetHwnd, targetPid) => {
               await invoke("macro_set_context", {
-                active: true,
+                active: settings.macroHotkeyOverride,
                 source,
                 selectedHwnd: targetHwnd,
                 selectedPid: targetPid,

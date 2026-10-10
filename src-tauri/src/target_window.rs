@@ -28,10 +28,18 @@ pub struct TargetCapabilities {
     pub reason: String,
 }
 
+fn process_name_matches(candidate: &str, selector: &str) -> bool {
+    candidate.eq_ignore_ascii_case(selector)
+        || candidate.rsplit_once('.').is_some_and(|(name, extension)| {
+            extension.eq_ignore_ascii_case("exe") && name.eq_ignore_ascii_case(selector)
+        })
+}
+
 #[cfg(windows)]
 mod win {
     use super::{TargetCapabilities, TargetWindow};
     use crate::macro_engine::TargetSelector;
+    use std::collections::HashMap;
     use std::ffi::c_void;
     use windows_sys::Win32::Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT};
     use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, ScreenToClient};
@@ -39,9 +47,10 @@ mod win {
     use windows_sys::Win32::System::Threading::OpenProcess;
     use windows_sys::Win32::UI::HiDpi::GetDpiForWindow;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
-        EnumWindows, GetClassNameW, GetClientRect, GetWindowTextW, GetWindowThreadProcessId,
-        IsIconic, IsWindow, IsWindowVisible, PostMessageW, WM_LBUTTONDOWN, WM_LBUTTONUP,
-        WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        EnumWindows, GetClassNameW, GetClientRect, GetWindowTextLengthW, GetWindowTextW,
+        GetWindowThreadProcessId, IsIconic, IsWindow, IsWindowVisible, PostMessageW,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_RBUTTONDOWN,
+        WM_RBUTTONUP,
     };
 
     const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
@@ -111,41 +120,147 @@ mod win {
         })
     }
 
+    struct WindowEnumeration {
+        windows: Vec<TargetWindow>,
+        process_names: HashMap<u32, Option<String>>,
+    }
+
     unsafe extern "system" fn collect_window(hwnd: HWND, data: LPARAM) -> i32 {
-        let windows = &mut *(data as *mut Vec<TargetWindow>);
-        if let Some(window) = describe(hwnd) {
-            if window.visible && !window.title.trim().is_empty() {
-                windows.push(window);
-            }
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
         }
+        let title = read_text(hwnd, false);
+        if title.trim().is_empty() {
+            return 1;
+        }
+
+        let enumeration = &mut *(data as *mut WindowEnumeration);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return 1;
+        }
+        let process_name = enumeration
+            .process_names
+            .entry(pid)
+            .or_insert_with(|| exe_name(pid))
+            .clone();
+        let Some(process_name) = process_name else {
+            return 1;
+        };
+
+        let mut rect: RECT = std::mem::zeroed();
+        let _ = GetClientRect(hwnd, &mut rect);
+        enumeration.windows.push(TargetWindow {
+            hwnd: hwnd as usize as u64,
+            pid,
+            process_name,
+            title,
+            class_name: read_text(hwnd, true),
+            visible: true,
+            minimized: IsIconic(hwnd) != 0,
+            client_width: rect.right.saturating_sub(rect.left),
+            client_height: rect.bottom.saturating_sub(rect.top),
+            dpi: GetDpiForWindow(hwnd),
+        });
         1
     }
 
     pub fn list() -> Vec<TargetWindow> {
-        let mut result: Vec<TargetWindow> = Vec::new();
+        let mut enumeration = WindowEnumeration {
+            windows: Vec::new(),
+            process_names: HashMap::new(),
+        };
         unsafe {
-            EnumWindows(Some(collect_window), &mut result as *mut _ as LPARAM);
+            EnumWindows(
+                Some(collect_window),
+                &mut enumeration as *mut WindowEnumeration as LPARAM,
+            );
         }
-        result.sort_by(|a, b| {
-            a.process_name
-                .to_lowercase()
-                .cmp(&b.process_name.to_lowercase())
-                .then_with(|| a.title.to_lowercase().cmp(&b.title.to_lowercase()))
-                .then_with(|| a.pid.cmp(&b.pid))
+        let mut result = enumeration.windows;
+        result.sort_by_cached_key(|window| {
+            (
+                window.process_name.to_lowercase(),
+                window.title.to_lowercase(),
+                window.pid,
+            )
         });
         result
     }
 
-    fn matches(window: &TargetWindow, selector: &TargetSelector) -> bool {
-        selector.process.as_ref().is_none_or(|process| {
-            window.process_name.eq_ignore_ascii_case(process)
-                || window
-                    .process_name
-                    .eq_ignore_ascii_case(&format!("{process}.exe"))
-        }) && selector
-            .title_contains
+    struct ProcessWindowSearch {
+        process_name: String,
+        process_names: HashMap<u32, Option<String>>,
+        found: bool,
+    }
+
+    unsafe extern "system" fn find_process_window(hwnd: HWND, data: LPARAM) -> i32 {
+        if IsWindowVisible(hwnd) == 0 {
+            return 1;
+        }
+        let title_length = GetWindowTextLengthW(hwnd);
+        if title_length <= 0 {
+            return 1;
+        }
+        let mut title_buffer = [0u16; 1025];
+        let title_read = GetWindowTextW(hwnd, title_buffer.as_mut_ptr(), title_buffer.len() as i32);
+        if title_read <= 0
+            || !title_buffer[..title_read as usize].iter().any(|unit| {
+                char::from_u32(u32::from(*unit)).is_some_and(|character| !character.is_whitespace())
+            })
+        {
+            return 1;
+        }
+
+        let search = &mut *(data as *mut ProcessWindowSearch);
+        let mut pid = 0;
+        GetWindowThreadProcessId(hwnd, &mut pid);
+        if pid == 0 {
+            return 1;
+        }
+        let process_name = search
+            .process_names
+            .entry(pid)
+            .or_insert_with(|| exe_name(pid));
+        if process_name
             .as_ref()
-            .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
+            .is_some_and(|name| super::process_name_matches(name, &search.process_name))
+        {
+            search.found = true;
+            0
+        } else {
+            1
+        }
+    }
+
+    pub fn process_window_exists(process_name: &str) -> bool {
+        let process_name = process_name.trim().to_owned();
+        if process_name.is_empty() {
+            return false;
+        }
+        let mut search = ProcessWindowSearch {
+            process_name,
+            process_names: HashMap::new(),
+            found: false,
+        };
+        unsafe {
+            EnumWindows(
+                Some(find_process_window),
+                &mut search as *mut ProcessWindowSearch as LPARAM,
+            );
+        }
+        search.found
+    }
+
+    fn matches(window: &TargetWindow, selector: &TargetSelector) -> bool {
+        selector
+            .process
+            .as_ref()
+            .is_none_or(|process| super::process_name_matches(&window.process_name, process))
+            && selector
+                .title_contains
+                .as_ref()
+                .is_none_or(|title| window.title.to_lowercase().contains(&title.to_lowercase()))
             && selector
                 .class_name
                 .as_ref()
@@ -433,6 +548,18 @@ mod win {
     }
 }
 
+#[cfg(test)]
+mod process_name_tests {
+    use super::process_name_matches;
+
+    #[test]
+    fn process_selector_accepts_optional_exe_suffix() {
+        assert!(process_name_matches("sample.exe", "sample"));
+        assert!(process_name_matches("sample.exe", "SAMPLE.EXE"));
+        assert!(!process_name_matches("sample.exe", "other"));
+    }
+}
+
 #[cfg(windows)]
 pub fn list_target_windows() -> Vec<TargetWindow> {
     win::list()
@@ -441,6 +568,16 @@ pub fn list_target_windows() -> Vec<TargetWindow> {
 #[cfg(not(windows))]
 pub fn list_target_windows() -> Vec<TargetWindow> {
     Vec::new()
+}
+
+#[cfg(windows)]
+pub fn target_process_window_exists(process_name: &str) -> bool {
+    win::process_window_exists(process_name)
+}
+
+#[cfg(not(windows))]
+pub fn target_process_window_exists(_process_name: &str) -> bool {
+    false
 }
 
 #[cfg(windows)]

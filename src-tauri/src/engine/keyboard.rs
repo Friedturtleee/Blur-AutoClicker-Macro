@@ -38,8 +38,17 @@ pub fn make_keyboard_input(vk: u16, flags: u32) -> INPUT {
 
 #[inline]
 pub fn send_key_event(vk: u16, flags: u32) {
+    let _ = try_send_key_event(vk, flags);
+}
+
+pub fn try_send_key_event(vk: u16, flags: u32) -> Result<(), String> {
     let input = make_keyboard_input(vk, flags);
-    unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    let accepted = unsafe { SendInput(1, &input, std::mem::size_of::<INPUT>() as i32) };
+    if accepted == 1 {
+        Ok(())
+    } else {
+        Err("Windows did not accept the keyboard input.".into())
+    }
 }
 
 pub fn is_alphabetic_vk(vk: u16) -> bool {

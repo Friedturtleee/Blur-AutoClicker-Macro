@@ -26,6 +26,8 @@ use image::ImageEncoder;
 const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
 const DI_NORMAL: u32 = 0x0003;
 const PROCESS_DISPLAY_TITLE_MAX_CHARS: usize = 35;
+const PROCESS_ICON_CACHE_MAX_ENTRIES: usize = 128;
+const PROCESS_ICON_MAX_DIMENSION: u32 = 256;
 
 extern "system" {
     fn QueryFullProcessImageNameW(
@@ -93,7 +95,7 @@ fn extract_icon_pixels(exe_path: &str) -> Option<(Vec<u8>, u32, u32)> {
         );
         let w = bm.bmWidth as u32;
         let h = bm.bmHeight as u32;
-        if w == 0 || h == 0 {
+        if w == 0 || h == 0 || w > PROCESS_ICON_MAX_DIMENSION || h > PROCESS_ICON_MAX_DIMENSION {
             DeleteObject(ii.hbmColor);
             DeleteObject(ii.hbmMask);
             DestroyIcon(hicon);
@@ -146,8 +148,26 @@ fn extract_icon_pixels(exe_path: &str) -> Option<(Vec<u8>, u32, u32)> {
             DI_NORMAL,
         );
         SelectObject(dc, old);
-        let size = (w * h * 4) as usize;
-        let mut buf = Vec::with_capacity(size);
+        let Some(size) = (w as usize)
+            .checked_mul(h as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+        else {
+            DeleteObject(dib);
+            DeleteDC(dc);
+            DeleteObject(ii.hbmColor);
+            DeleteObject(ii.hbmMask);
+            DestroyIcon(hicon);
+            return None;
+        };
+        let mut buf = Vec::new();
+        if buf.try_reserve_exact(size).is_err() {
+            DeleteObject(dib);
+            DeleteDC(dc);
+            DeleteObject(ii.hbmColor);
+            DeleteObject(ii.hbmMask);
+            DestroyIcon(hicon);
+            return None;
+        }
         std::ptr::copy_nonoverlapping(pixels, buf.as_mut_ptr(), size);
         buf.set_len(size);
         DeleteObject(dib);
@@ -183,6 +203,15 @@ fn get_icon_for_process(exe_name: &str, pid: u32) -> Option<String> {
     }
     let icon = get_process_exe_path(pid).and_then(|path| extract_process_icon_base64(&path));
     let mut cache = icon_cache().lock().unwrap_or_else(poisoned_inner);
+    if let Some(cached) = cache.get(exe_name) {
+        return cached.clone();
+    }
+    // Process-list refreshes can see many one-off executables over a long run.
+    if cache.len() >= PROCESS_ICON_CACHE_MAX_ENTRIES {
+        if let Some(key) = cache.keys().next().cloned() {
+            cache.remove(&key);
+        }
+    }
     cache.insert(exe_name.to_string(), icon.clone());
     icon
 }
@@ -277,7 +306,18 @@ pub fn get_foreground_process_name() -> Option<String> {
     if pid == 0 {
         return None;
     }
-    get_process_name_from_pid(pid)
+    // Querying the executable path for one known PID avoids taking and scanning a
+    // full process snapshot on every foreground safety check. Some protected
+    // processes reject this query, so retain the snapshot lookup as a fallback.
+    let process_name = get_process_exe_path(pid)
+        .and_then(|path| {
+            path.rsplit(['\\', '/'])
+                .next()
+                .filter(|name| !name.is_empty())
+                .map(str::to_owned)
+        })
+        .or_else(|| get_process_name_from_pid(pid))?;
+    Some(process_name)
 }
 
 fn prefer_titled_pid(existing: u32, candidate: u32, has_title: impl Fn(u32) -> bool) -> u32 {
@@ -332,11 +372,7 @@ pub fn list_running_processes() -> Vec<ProcessInfo> {
             })
         })
         .collect();
-    result.sort_by(|a, b| {
-        a.display_name
-            .to_lowercase()
-            .cmp(&b.display_name.to_lowercase())
-    });
+    result.sort_by_cached_key(|process| process.display_name.to_lowercase());
     result
 }
 
@@ -344,20 +380,27 @@ pub fn check_process_list(config: &ClickerConfig) -> Option<()> {
     if !config.process_list_enabled {
         return None;
     }
-    let current = get_foreground_process_name()?.to_lowercase();
-    let matching_entry = config
-        .process_list_entries
-        .iter()
-        .find(|e| e.enabled && e.name == current);
-    let is_in_list = matching_entry.is_some();
-    let triggered = match config.process_list_mode {
+    process_list_blocks(
+        config.process_list_mode,
+        get_foreground_process_name().as_deref(),
+        &config.process_list_entries,
+    )
+    .then_some(())
+}
+
+fn process_list_blocks(
+    mode: super::ProcessListMode,
+    foreground_process: Option<&str>,
+    entries: &[super::ProcessListEntry],
+) -> bool {
+    let is_in_list = foreground_process.is_some_and(|current| {
+        entries
+            .iter()
+            .any(|entry| entry.enabled && entry.name.eq_ignore_ascii_case(current))
+    });
+    match mode {
         super::ProcessListMode::Whitelist => !is_in_list,
         super::ProcessListMode::Blacklist => is_in_list,
-    };
-    if triggered {
-        Some(())
-    } else {
-        None
     }
 }
 
@@ -447,5 +490,43 @@ mod tests {
         assert_eq!(prefer_titled_pid(2000, 3000, has_title), 2000);
         let none = |_pid: u32| false;
         assert_eq!(prefer_titled_pid(1000, 2000, none), 1000);
+    }
+
+    #[test]
+    fn unknown_foreground_process_is_blocked_by_a_whitelist_only() {
+        let entries = vec![crate::engine::ProcessListEntry {
+            name: "allowed.exe".into(),
+            enabled: true,
+        }];
+
+        assert!(process_list_blocks(
+            super::super::ProcessListMode::Whitelist,
+            None,
+            &entries
+        ));
+        assert!(!process_list_blocks(
+            super::super::ProcessListMode::Blacklist,
+            None,
+            &entries
+        ));
+    }
+
+    #[test]
+    fn process_list_matching_is_case_insensitive() {
+        let entries = vec![crate::engine::ProcessListEntry {
+            name: "allowed.exe".into(),
+            enabled: true,
+        }];
+
+        assert!(!process_list_blocks(
+            super::super::ProcessListMode::Whitelist,
+            Some("ALLOWED.EXE"),
+            &entries
+        ));
+        assert!(process_list_blocks(
+            super::super::ProcessListMode::Blacklist,
+            Some("ALLOWED.EXE"),
+            &entries
+        ));
     }
 }

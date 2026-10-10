@@ -389,6 +389,7 @@ export function AdvDropdown({
   ariaLabel,
   disabled = false,
   className = "",
+  portalClassName = "",
 }: {
   value: string;
   options: readonly { value: string; label: string }[];
@@ -399,6 +400,7 @@ export function AdvDropdown({
   ariaLabel?: string;
   disabled?: boolean;
   className?: string;
+  portalClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
   const [positioned, setPositioned] = useState(false);
@@ -406,6 +408,10 @@ export function AdvDropdown({
   const [pos, setPos] = useState({ top: 0, left: 0 });
   const ref = useRef<HTMLDivElement>(null);
   const menuRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (disabled) setOpen(false);
+  }, [disabled]);
 
   const toggle = () => {
     if (disabled) return;
@@ -551,7 +557,7 @@ export function AdvDropdown({
         createPortal(
           <div
             ref={menuRef}
-            className="adv-dropdown-menu adv-dropdown-menu--portal"
+            className={`adv-dropdown-menu adv-dropdown-menu--portal ${portalClassName}`.trim()}
             role="listbox"
             aria-label={ariaLabel}
             aria-hidden={!positioned}
