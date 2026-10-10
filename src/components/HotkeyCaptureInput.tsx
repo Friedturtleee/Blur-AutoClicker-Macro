@@ -26,6 +26,7 @@ interface Props {
   onChange: (next: string) => void;
   className: string;
   style?: React.CSSProperties;
+  ariaLabel?: string;
   conflicts?: string[];
   reserved?: boolean;
   editable?: boolean;
@@ -37,7 +38,16 @@ export interface HotkeyCaptureInputHandle {
 
 const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
   function HotkeyCaptureInput(
-    { value, onChange, className, style, conflicts, reserved, editable = true },
+    {
+      value,
+      onChange,
+      className,
+      style,
+      ariaLabel,
+      conflicts,
+      reserved,
+      editable = true,
+    },
     ref,
   ) {
     const [listening, setListening] = useState(false);
@@ -441,6 +451,7 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
           ref={inputRef}
           type="button"
           className={`${className} hk-button`}
+          aria-label={ariaLabel}
           style={{
             ...style,
             paddingRight:

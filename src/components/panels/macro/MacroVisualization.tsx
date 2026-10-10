@@ -1,8 +1,16 @@
-import { memo, useDeferredValue, useEffect, useMemo, useState } from "react";
+import {
+  memo,
+  useDeferredValue,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { createPortal } from "react-dom";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import {
   buildMacroVisualization,
+  type CoordinateSpace,
   type MacroVisualAction,
 } from "../../../macro/visualization";
 
@@ -33,12 +41,54 @@ function actionLabel(action: MacroVisualAction) {
 const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
   const [actionPageState, setActionPageState] = useState({ source, page: 0 });
   const [isFullscreen, setIsFullscreen] = useState(false);
+  const [isTogglingFullscreen, setIsTogglingFullscreen] = useState(false);
+  const [fullscreenError, setFullscreenError] = useState("");
   const [isTransparent, setIsTransparent] = useState(false);
+  const [mapSpace, setMapSpace] = useState<CoordinateSpace>("screen");
+  const [displayScale, setDisplayScale] = useState(1);
+  const fullscreenToggleRef = useRef(false);
+  const fullscreenButtonRef = useRef<HTMLButtonElement>(null);
+  const previousFullscreenRef = useRef(isFullscreen);
+  const mountedRef = useRef(true);
+  const mapSvgRef = useRef<SVGSVGElement>(null);
   const visualizationSource = useDeferredValue(source);
   const visualization = useMemo(
     () => buildMacroVisualization(visualizationSource),
     [visualizationSource],
   );
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+  useEffect(() => {
+    if (previousFullscreenRef.current === isFullscreen) return;
+    previousFullscreenRef.current = isFullscreen;
+    fullscreenButtonRef.current?.focus();
+  }, [isFullscreen]);
+  useEffect(() => {
+    if (!isFullscreen) {
+      setDisplayScale(1);
+      return;
+    }
+    const element = mapSvgRef.current;
+    if (!element) return;
+    const updateScale = () => {
+      const nextScale = Math.max(
+        1,
+        Math.min(element.clientWidth / 320, element.clientHeight / 168),
+      );
+      setDisplayScale((current) =>
+        Math.abs(current - nextScale) < 0.01 ? current : nextScale,
+      );
+    };
+    updateScale();
+    const observer = new ResizeObserver(updateScale);
+    observer.observe(element);
+    return () => observer.disconnect();
+  }, [isFullscreen]);
+  const mapUnit = (value: number) => value / displayScale;
   const actionPage =
     actionPageState.source === source ? actionPageState.page : 0;
   const actionPageCount = Math.max(
@@ -59,59 +109,116 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
     currentActionPage * ACTION_PAGE_SIZE,
     (currentActionPage + 1) * ACTION_PAGE_SIZE,
   );
-  const coordinateActions = visualization.actions.filter(
-    (action) => action.x !== undefined && action.y !== undefined,
+  const coordinateActions = useMemo(
+    () =>
+      visualization.actions.filter(
+        (action) => action.x !== undefined && action.y !== undefined,
+      ),
+    [visualization.actions],
   );
-  const plottedMapActions = visualization.actions.slice(0, MAP_MARKER_LIMIT);
-  const plottedClickPoints = visualization.clickPoints
-    .filter((point) => point.firstOrder <= MAP_MARKER_LIMIT)
-    .slice(0, MAP_MARKER_LIMIT);
-  const plottedActions = coordinateActions;
-  let minX = plottedActions.length ? Number.POSITIVE_INFINITY : 0;
-  let maxX = plottedActions.length ? Number.NEGATIVE_INFINITY : 1;
-  let minY = plottedActions.length ? Number.POSITIVE_INFINITY : 0;
-  let maxY = plottedActions.length ? Number.NEGATIVE_INFINITY : 1;
-  const includePoint = (x: number, y: number) => {
-    minX = Math.min(minX, x);
-    maxX = Math.max(maxX, x);
-    minY = Math.min(minY, y);
-    maxY = Math.max(maxY, y);
-  };
-  plottedActions.forEach((action) => {
-    includePoint(action.x!, action.y!);
-    if (action.fromX !== undefined && action.fromY !== undefined)
-      includePoint(action.fromX, action.fromY);
-  });
-  const plot = (x: number, y: number) => ({
-    x: 18 + ((x - minX) / Math.max(1, maxX - minX)) * 284,
-    y: 18 + ((y - minY) / Math.max(1, maxY - minY)) * 132,
-  });
-  const mapRadiusScale = Math.min(
-    maxX > minX ? 284 / (maxX - minX) : 1,
-    maxY > minY ? 132 / (maxY - minY) : 1,
+  const coordinateSpaces = useMemo(
+    () =>
+      (["screen", "client"] as const).filter((space) =>
+        coordinateActions.some((action) => action.space === space),
+      ),
+    [coordinateActions],
   );
-  const trajectoryPoints = coordinateActions
-    .flatMap((action) => {
-      const start =
+  const activeMapSpace = coordinateSpaces.includes(mapSpace)
+    ? mapSpace
+    : (coordinateSpaces[0] ?? "screen");
+  const mapSpaceActions = useMemo(
+    () => coordinateActions.filter((action) => action.space === activeMapSpace),
+    [activeMapSpace, coordinateActions],
+  );
+  const plottedMapActions = useMemo(
+    () => mapSpaceActions.slice(0, MAP_MARKER_LIMIT),
+    [mapSpaceActions],
+  );
+  const lastPlottedOrder =
+    plottedMapActions[plottedMapActions.length - 1]?.order ?? 0;
+  const plottedClickPoints = useMemo(
+    () =>
+      visualization.clickPoints
+        .filter(
+          (point) =>
+            point.space === activeMapSpace &&
+            point.firstOrder <= lastPlottedOrder,
+        )
+        .slice(0, MAP_MARKER_LIMIT),
+    [activeMapSpace, lastPlottedOrder, visualization.clickPoints],
+  );
+  const mapGeometry = useMemo(() => {
+    let minX = mapSpaceActions.length ? Number.POSITIVE_INFINITY : 0;
+    let maxX = mapSpaceActions.length ? Number.NEGATIVE_INFINITY : 1;
+    let minY = mapSpaceActions.length ? Number.POSITIVE_INFINITY : 0;
+    let maxY = mapSpaceActions.length ? Number.NEGATIVE_INFINITY : 1;
+    const includePoint = (x: number, y: number) => {
+      minX = Math.min(minX, x);
+      maxX = Math.max(maxX, x);
+      minY = Math.min(minY, y);
+      maxY = Math.max(maxY, y);
+    };
+    mapSpaceActions.forEach((action) => {
+      includePoint(action.x!, action.y!);
+      if (action.fromX !== undefined && action.fromY !== undefined)
+        includePoint(action.fromX, action.fromY);
+    });
+    const spanX = maxX - minX;
+    const spanY = maxY - minY;
+    const coordinateScale = Math.min(
+      spanX > 0 ? 284 / spanX : Number.POSITIVE_INFINITY,
+      spanY > 0 ? 132 / spanY : Number.POSITIVE_INFINITY,
+    );
+    const mapRadiusScale = Number.isFinite(coordinateScale)
+      ? coordinateScale
+      : 1;
+    const offsetX = 18 + (284 - spanX * mapRadiusScale) / 2;
+    const offsetY = 18 + (132 - spanY * mapRadiusScale) / 2;
+    const plot = (x: number, y: number) => ({
+      x: spanX === 0 ? 160 : offsetX + (x - minX) * mapRadiusScale,
+      y: spanY === 0 ? 84 : offsetY + (y - minY) * mapRadiusScale,
+    });
+    const pathCoordinates: string[] = [];
+    mapSpaceActions.forEach((action) => {
+      if (
         action.kind === "move" &&
         action.fromX !== undefined &&
         action.fromY !== undefined
-          ? [plot(action.fromX, action.fromY)]
-          : [];
-      return [...start, plot(action.x!, action.y!)];
-    })
-    .map((position) => {
-      return `${position.x},${position.y}`;
-    })
-    .join(" ");
+      ) {
+        const start = plot(action.fromX, action.fromY);
+        pathCoordinates.push(`${start.x},${start.y}`);
+      }
+      const end = plot(action.x!, action.y!);
+      pathCoordinates.push(`${end.x},${end.y}`);
+    });
+    const trajectoryPoints = pathCoordinates.join(" ");
+    return { plot, mapRadiusScale, trajectoryPoints };
+  }, [mapSpaceActions]);
+  const { plot, mapRadiusScale, trajectoryPoints } = mapGeometry;
 
   const toggleFullscreen = async () => {
+    if (fullscreenToggleRef.current) return;
+    fullscreenToggleRef.current = true;
+    setIsTogglingFullscreen(true);
     try {
       const appWindow = getCurrentWindow();
-      await appWindow.setFullscreen(!isFullscreen);
-      setIsFullscreen((current) => !current);
+      const nextFullscreen = !isFullscreen;
+      await appWindow.setFullscreen(nextFullscreen);
+      if (!mountedRef.current) {
+        if (nextFullscreen) await appWindow.setFullscreen(false);
+        return;
+      }
+      setIsFullscreen(nextFullscreen);
+      setFullscreenError("");
     } catch (error) {
       console.error("Could not toggle Action Map fullscreen:", error);
+      if (mountedRef.current)
+        setFullscreenError(
+          "Could not change fullscreen mode: " + String(error),
+        );
+    } finally {
+      fullscreenToggleRef.current = false;
+      if (mountedRef.current) setIsTogglingFullscreen(false);
     }
   };
 
@@ -151,9 +258,12 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
           {visualization.actions.length} actions
         </span>
         <button
+          ref={fullscreenButtonRef}
           type="button"
           className="adv-secondary-btn macro-button macro-map-fullscreen-toggle"
           onClick={() => void toggleFullscreen()}
+          disabled={isTogglingFullscreen}
+          aria-busy={isTogglingFullscreen}
           aria-label={
             isFullscreen
               ? "Exit fullscreen action map"
@@ -161,27 +271,84 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
           }
           title={isFullscreen ? "Exit fullscreen (Esc)" : "Show fullscreen"}
         >
-          {isFullscreen ? "Exit fullscreen" : "⛶ Fullscreen"}
+          <svg
+            className="macro-fullscreen-icon"
+            viewBox="0 0 16 16"
+            fill="none"
+            stroke="currentColor"
+            strokeWidth="1.5"
+            strokeLinecap="round"
+            strokeLinejoin="round"
+            aria-hidden="true"
+          >
+            {isFullscreen ? (
+              <path d="M6 2v4H2M10 2v4h4M6 14v-4H2M10 14v-4h4" />
+            ) : (
+              <path d="M2 6V2h4M10 2h4v4M14 10v4h-4M6 14H2v-4" />
+            )}
+          </svg>
+          <span>{isFullscreen ? "Exit fullscreen" : "Fullscreen"}</span>
         </button>
       </div>
-      {isFullscreen && (
+      {fullscreenError && (
+        <div className="macro-map-error" role="alert">
+          {fullscreenError}
+        </div>
+      )}
+      {(coordinateSpaces.length > 0 || isFullscreen) && (
         <div className="macro-map-display-controls">
-          <span>Full macro route · {visualization.actions.length} actions</span>
-          <button
-            type="button"
-            className="adv-secondary-btn macro-button"
-            aria-pressed={isTransparent}
-            onClick={() => setIsTransparent((current) => !current)}
-          >
-            {isTransparent ? "Transparent: On" : "Transparent: Off"}
-          </button>
+          {coordinateSpaces.length > 1 && (
+            <div
+              className="macro-map-space-options"
+              role="group"
+              aria-label="Coordinate space"
+            >
+              <span>View</span>
+              {coordinateSpaces.map((space) => (
+                <button
+                  key={space}
+                  type="button"
+                  className="adv-secondary-btn macro-button macro-map-space-button"
+                  aria-pressed={activeMapSpace === space}
+                  onClick={() => setMapSpace(space)}
+                >
+                  {space === "screen" ? "Screen" : "Client"}
+                </button>
+              ))}
+            </div>
+          )}
+          {coordinateSpaces.length === 1 && (
+            <span className="macro-map-space-label">
+              {activeMapSpace === "screen"
+                ? "Screen coordinates"
+                : "Client coordinates"}
+            </span>
+          )}
+          {isFullscreen && (
+            <>
+              <span className="macro-map-display-summary">
+                {coordinateSpaces.length > 0
+                  ? `${activeMapSpace} route · ${mapSpaceActions.length} coordinate actions`
+                  : "No coordinate actions"}
+              </span>
+              <button
+                type="button"
+                className="adv-secondary-btn macro-button"
+                aria-pressed={isTransparent}
+                onClick={() => setIsTransparent((current) => !current)}
+              >
+                {isTransparent ? "Transparent: On" : "Transparent: Off"}
+              </button>
+            </>
+          )}
         </div>
       )}
       <svg
+        ref={mapSvgRef}
         className="macro-action-map"
         viewBox="0 0 320 168"
         role="img"
-        aria-label="Coordinates and ordered macro actions parsed from click, move, and scroll commands"
+        aria-label={`Coordinates and ordered macro actions in ${activeMapSpace} space, parsed from click, move, and scroll commands`}
       >
         <defs>
           <pattern
@@ -190,16 +357,21 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
             height="24"
             patternUnits="userSpaceOnUse"
           >
-            <path d="M 24 0 L 0 0 0 24" className="macro-map-grid-line" />
+            <path
+              d="M 24 0 L 0 0 0 24"
+              className="macro-map-grid-line"
+              vectorEffect="non-scaling-stroke"
+            />
           </pattern>
           <marker
             id="macro-map-arrowhead"
             viewBox="0 0 10 10"
             refX="8"
             refY="5"
-            markerWidth="5"
-            markerHeight="5"
             orient="auto-start-reverse"
+            markerUnits="userSpaceOnUse"
+            markerWidth={mapUnit(5)}
+            markerHeight={mapUnit(5)}
           >
             <path d="M 0 0 L 10 5 L 0 10 z" className="macro-map-arrowhead" />
           </marker>
@@ -211,6 +383,7 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
           height="168"
           rx="8"
           className="macro-map-background"
+          vectorEffect="non-scaling-stroke"
         />
         <rect
           x="0"
@@ -224,7 +397,6 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
           <polyline
             points={trajectoryPoints}
             className="macro-map-trajectory"
-            markerMid="url(#macro-map-arrowhead)"
             markerEnd="url(#macro-map-arrowhead)"
           />
         )}
@@ -252,16 +424,29 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
                   y2={end.y}
                   className="macro-map-move"
                   markerEnd="url(#macro-map-arrowhead)"
+                  vectorEffect="non-scaling-stroke"
                 />
               ) : (
-                <text x={end.x} y={end.y - 7} className="macro-map-move-icon">
+                <text
+                  x={end.x}
+                  y={end.y - mapUnit(7)}
+                  className="macro-map-move-icon"
+                  style={{
+                    fontSize: mapUnit(8),
+                    strokeWidth: mapUnit(2.5),
+                  }}
+                >
                   ↗
                 </text>
               )}
               <text
-                x={end.x + 5}
-                y={end.y - 5}
+                x={end.x + mapUnit(5)}
+                y={end.y - mapUnit(5)}
                 className="macro-map-move-number"
+                style={{
+                  fontSize: mapUnit(8),
+                  strokeWidth: mapUnit(2.5),
+                }}
               >
                 {action.order}
               </text>
@@ -283,26 +468,33 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
                   cy={location.y}
                   r={Math.min(60, Math.max(7, point.radius * mapRadiusScale))}
                   className="macro-map-click-radius"
+                  vectorEffect="non-scaling-stroke"
                 />
               )}
               <circle
                 cx={location.x}
                 cy={location.y}
-                r="7"
+                r={mapUnit(7)}
                 className="macro-map-click"
+                vectorEffect="non-scaling-stroke"
               />
               <text
                 x={location.x}
-                y={location.y + 3}
+                y={location.y + mapUnit(3)}
                 className="macro-map-point-number"
+                style={{ fontSize: mapUnit(7) }}
               >
                 {point.firstOrder}
               </text>
               {point.clicks > 1 && (
                 <text
-                  x={location.x + 10}
-                  y={location.y - 6}
+                  x={location.x + mapUnit(10)}
+                  y={location.y - mapUnit(6)}
                   className="macro-map-count"
+                  style={{
+                    fontSize: mapUnit(7),
+                    strokeWidth: mapUnit(2.5),
+                  }}
                 >
                   ×{point.clicks}
                 </text>
@@ -322,8 +514,8 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
           const direction =
             action.delta === 0 ? "↕" : action.delta! > 0 ? "↑" : "↓";
           const badge = {
-            x: Math.min(302, location.x + 11),
-            y: Math.max(10, location.y - 10),
+            x: Math.min(320 - mapUnit(18), location.x + mapUnit(11)),
+            y: Math.max(mapUnit(10), location.y - mapUnit(10)),
           };
           return (
             <g key={`scroll-${action.order}`}>
@@ -334,37 +526,54 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
                 x2={badge.x}
                 y2={badge.y}
                 className="macro-map-scroll-stem"
+                vectorEffect="non-scaling-stroke"
               />
               <circle
                 cx={badge.x}
                 cy={badge.y}
-                r="8"
+                r={mapUnit(8)}
                 className="macro-map-scroll"
+                vectorEffect="non-scaling-stroke"
               />
               <text
                 x={badge.x}
-                y={badge.y + 4}
+                y={badge.y + mapUnit(4)}
                 className="macro-map-scroll-icon"
+                style={{ fontSize: mapUnit(7) }}
               >
                 {direction}
               </text>
-              <text x={badge.x + 9} y={badge.y - 5} className="macro-map-count">
+              <text
+                x={badge.x + mapUnit(9)}
+                y={badge.y - mapUnit(5)}
+                className="macro-map-count"
+                style={{
+                  fontSize: mapUnit(7),
+                  strokeWidth: mapUnit(2.5),
+                }}
+              >
                 {action.order}
                 {action.repetitions > 1 ? ` ×${action.repetitions}` : ""}
               </text>
             </g>
           );
         })}
-        {plottedActions.length === 0 && (
-          <text x="160" y="86" textAnchor="middle" className="macro-map-empty">
+        {mapSpaceActions.length === 0 && (
+          <text
+            x="160"
+            y="86"
+            textAnchor="middle"
+            className="macro-map-empty"
+            style={{ fontSize: mapUnit(9) }}
+          >
             Add numeric click, move, or scroll coordinates
           </text>
         )}
       </svg>
-      {visualization.actions.length > MAP_MARKER_LIMIT && (
+      {mapSpaceActions.length > MAP_MARKER_LIMIT && (
         <span className="macro-visualization-note">
-          The route includes every coordinate action; numbered markers show the
-          first {MAP_MARKER_LIMIT}.
+          The route includes every {activeMapSpace} coordinate action; numbered
+          markers show the first {MAP_MARKER_LIMIT}.
         </span>
       )}
       {visualization.actions.length > ACTION_PAGE_SIZE && (

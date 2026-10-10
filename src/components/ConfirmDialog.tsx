@@ -23,10 +23,19 @@ export default function ConfirmDialog({
   onCancel,
 }: Props) {
   const cancelRef = useRef<HTMLButtonElement>(null);
+  const focusRestoreRef = useRef<HTMLElement | null>(null);
 
   useEffect(() => {
-    if (!open) return;
+    if (!open) {
+      const previousFocus = focusRestoreRef.current;
+      focusRestoreRef.current = null;
+      if (previousFocus?.isConnected) previousFocus.focus();
+      return;
+    }
 
+    if (!focusRestoreRef.current) {
+      focusRestoreRef.current = document.activeElement as HTMLElement | null;
+    }
     cancelRef.current?.focus();
 
     const handleKey = (e: KeyboardEvent) => {

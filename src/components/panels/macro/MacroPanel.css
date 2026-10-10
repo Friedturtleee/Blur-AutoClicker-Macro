@@ -1,7 +1,15 @@
 .macro-panel {
   min-height: 0;
-  color: var(--text);
+  color: var(--text-primary);
   font-family: var(--font-family-base);
+}
+
+.macro-panel * {
+  font-family: var(--font-family-base);
+}
+
+.macro-editor-codemirror .cm-scroller {
+  font-family: "Cascadia Mono", Consolas, monospace;
 }
 
 .macro-panel :where(button, input, textarea, select) {
@@ -42,6 +50,15 @@
   cursor: not-allowed;
 }
 
+.macro-enable-toggle .adv-toggle-btn:disabled.active {
+  opacity: 1;
+  cursor: default;
+}
+
+.macro-enable-toggle .adv-toggle-off.active {
+  color: var(--accent-red);
+}
+
 .macro-content {
   position: relative;
   display: flex;
@@ -52,21 +69,35 @@
   overflow: hidden;
 }
 
-.macro-content.is-disabled::after {
+.macro-content::after {
   position: absolute;
   z-index: 20;
   inset: 0;
   display: grid;
   place-items: center;
   border-radius: var(--radius-sm);
-  background: color-mix(in srgb, var(--bg-surface) 52%, transparent);
-  backdrop-filter: grayscale(1);
+  background: color-mix(in srgb, var(--bg-surface) 42%, transparent);
+  backdrop-filter: grayscale(0.85);
   color: var(--text-primary);
   content: "Macro Off";
   font-size: 0.9rem;
   font-weight: var(--font-weight-hv);
   letter-spacing: 0.02em;
+  opacity: 0;
+  visibility: hidden;
+  pointer-events: none;
+  transition:
+    opacity 0.16s ease,
+    visibility 0s linear 0.16s;
+}
+
+.macro-content.is-disabled::after {
+  opacity: 1;
+  visibility: visible;
   pointer-events: auto;
+  transition:
+    opacity 0.16s ease,
+    visibility 0s;
 }
 
 .macro-config-card {
@@ -101,13 +132,13 @@
 .macro-panel input,
 .macro-panel textarea,
 .macro-panel select {
-  color: var(--text);
+  color: var(--text-primary);
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
   font-family: var(--font-family-base);
   font-size: inherit;
-  font-weight: inherit;
+  font-weight: var(--font-weight-md);
   letter-spacing: inherit;
   line-height: inherit;
   min-height: var(--adv-control-height);
@@ -152,7 +183,7 @@
 
 .macro-target-row {
   display: grid;
-  grid-template-columns: minmax(11rem, 0.8fr) minmax(13rem, 1.5fr) auto minmax(
+  grid-template-columns: minmax(11rem, 0.8fr) minmax(13rem, 1.5fr) minmax(
       11rem,
       0.85fr
     );
@@ -179,6 +210,20 @@
 
 .macro-target {
   flex: 1;
+}
+
+.macro-target-label {
+  display: inline-flex;
+  align-items: center;
+  white-space: nowrap;
+}
+
+.macro-target-control {
+  display: flex;
+  flex: 1 1 auto;
+  align-items: center;
+  gap: 0.15rem;
+  min-width: 0;
 }
 
 .macro-panel .adv-dropdown-trigger {
@@ -227,7 +272,7 @@
 .macro-dropdown-menu .adv-dropdown-item {
   max-width: 100%;
   font-family: var(--font-family-base);
-  font-size: 1rem;
+  font-size: 0.875rem;
   font-weight: var(--font-weight-md);
   white-space: normal;
 }
@@ -254,7 +299,6 @@
 }
 
 .macro-capability,
-.macro-recorder-warning,
 .macro-recorder-note,
 .macro-unverified,
 .macro-run-reason,
@@ -291,6 +335,14 @@
   gap: 0.45rem;
   flex: 1;
   min-height: 0;
+  overflow: auto;
+  overscroll-behavior: contain;
+  padding-right: 0.15rem;
+}
+
+.macro-record-view > :not(.macro-timeline),
+.macro-history-view > :not(.macro-history-list) {
+  flex: 0 0 auto;
 }
 
 .macro-editor-workspace {
@@ -322,6 +374,10 @@
   height: 100%;
   background: transparent;
   font-family: var(--font-family-base);
+}
+
+.macro-editor-codemirror[aria-disabled="true"] .cm-content {
+  cursor: not-allowed;
 }
 
 .macro-editor-codemirror .cm-content {
@@ -536,37 +592,6 @@
   font-size: 0.7rem;
 }
 
-.macro-diagnostics:has(+ .macro-reference) {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.macro-reference {
-  color: var(--text-dim);
-  font-size: 0.7rem;
-}
-
-.macro-reference summary {
-  cursor: pointer;
-}
-
-.macro-reference > div {
-  display: grid;
-  grid-template-columns: 1fr 1fr;
-  gap: 0.2rem 0.6rem;
-  padding: 0.35rem 0;
-}
-
-.macro-reference code {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  color: var(--text);
-  font:
-    0.65rem Consolas,
-    monospace;
-}
-
 .macro-dirty {
   margin-left: auto;
   color: var(--text-dim);
@@ -597,9 +622,36 @@
   line-height: 1.3;
 }
 
-.macro-recorder-warning {
-  color: #f0c66d;
-  background: color-mix(in srgb, #f0c66d 10%, var(--bg-elevated));
+.macro-recorder-active {
+  display: flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--accent-strong) 12%, var(--bg-elevated));
+  color: var(--accent-strong);
+  font-size: 0.7rem;
+  line-height: 1.35;
+}
+
+.macro-recorder-status {
+  padding: 0.4rem 0.55rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-muted);
+  font-size: 0.7rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.macro-recorder-status.is-error {
+  border-color: color-mix(in srgb, var(--danger) 32%, transparent);
+  background: color-mix(in srgb, var(--danger) 9%, var(--bg-elevated));
+  color: var(--danger);
 }
 
 .macro-recorder-options {
@@ -623,15 +675,6 @@
   min-height: 1.8rem;
   text-align: center;
   font-variant-numeric: tabular-nums;
-}
-
-.macro-recorder-feature {
-  padding: 0.2rem 0.45rem;
-  border: 1px solid color-mix(in srgb, var(--accent) 28%, transparent);
-  border-radius: 99px;
-  color: var(--accent-strong);
-  background: color-mix(in srgb, var(--accent) 8%, transparent);
-  font-size: 0.65rem;
 }
 
 .macro-recorder-mode {
@@ -658,7 +701,8 @@
   flex-wrap: wrap;
 }
 
-.macro-hotkey-settings label {
+.macro-hotkey-settings > label,
+.macro-record-hotkey-setting {
   display: flex;
   align-items: center;
   gap: 0.4rem;
@@ -669,6 +713,74 @@
 
 .macro-hotkey-settings input {
   width: 8rem;
+}
+
+.macro-hotkey-settings .hk-wrapper {
+  flex: 0 1 8rem;
+  min-width: 8rem;
+}
+
+.macro-hotkey-settings .hk-button {
+  width: 100%;
+  font-family: var(--font-family-base);
+}
+
+.macro-run-hotkey {
+  display: grid;
+  grid-template-columns: minmax(6.5rem, auto) minmax(9rem, 1fr) minmax(
+      9rem,
+      12rem
+    );
+  align-items: center;
+  gap: 0.4rem 0.65rem;
+  padding: 0.65rem 0.75rem;
+  border-bottom: 1px solid var(--border-subtle);
+}
+
+.macro-run-hotkey-label {
+  display: contents;
+}
+
+.macro-run-hotkey-label > span {
+  color: var(--text-dim);
+  font-size: 0.82rem;
+  font-weight: var(--font-weight-hv);
+}
+
+.macro-run-hotkey-manual {
+  width: 100%;
+  min-width: 0;
+}
+
+.macro-run-hotkey-capture {
+  justify-content: center;
+  width: 100%;
+}
+
+.macro-run-hotkey > small {
+  grid-column: 1 / -1;
+  color: var(--text-dim);
+  font-size: 0.68rem;
+  line-height: 1.35;
+}
+
+.macro-run-hotkey > small.has-error {
+  color: var(--accent-red);
+}
+
+.macro-run-hotkey.is-disabled .hk-wrapper {
+  opacity: 0.55;
+  pointer-events: none;
+}
+
+@media (max-width: 600px) {
+  .macro-run-hotkey {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  .macro-run-hotkey-label > span {
+    grid-column: 1 / -1;
+  }
 }
 
 .macro-recorder-controls {
@@ -688,18 +800,20 @@
 
 .macro-state-pill[data-state="Recording"],
 .macro-state-pill[data-state="Running"] {
-  color: #8ee5a7;
-  background: color-mix(in srgb, #28a35c 18%, var(--bg-elevated));
+  color: var(--accent-strong);
+  background: color-mix(in srgb, var(--accent-strong) 14%, var(--bg-elevated));
 }
 
-.macro-state-pill[data-state="Countdown"] {
+.macro-state-pill[data-state="Countdown"],
+.macro-state-pill[data-state="Preparing"] {
   color: var(--accent-strong);
   background: color-mix(in srgb, var(--accent) 10%, var(--bg-elevated));
   font-variant-numeric: tabular-nums;
 }
 
 .macro-state-pill[data-state="Error"] {
-  color: #ff9797;
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-elevated));
 }
 
 .macro-timeline,
@@ -860,17 +974,24 @@
 }
 
 .macro-run-error {
-  color: #ff9797;
-  background: color-mix(in srgb, #e45c5c 12%, var(--bg-elevated));
+  color: var(--danger);
+  background: color-mix(in srgb, var(--danger) 12%, var(--bg-elevated));
 }
 
 .macro-run-reason {
-  color: var(--text);
+  color: var(--text-primary);
 }
 
 .macro-unverified {
   margin: 0;
-  color: #f0c66d;
+  color: var(--accent-yellow);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .macro-content::after,
+  .macro-content.is-disabled::after {
+    transition: none;
+  }
 }
 
 html.macro-map-fullscreen,
@@ -923,14 +1044,58 @@ html.macro-map-fullscreen #root {
 .macro-map-display-controls {
   display: flex;
   flex: 0 0 auto;
+  flex-wrap: wrap;
   align-items: center;
   gap: 0.75rem;
   color: var(--text-muted);
   font-size: 0.78rem;
 }
 
+.macro-map-space-options {
+  display: inline-flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 0.25rem;
+}
+
+.macro-map-space-options > span,
+.macro-map-space-label {
+  color: var(--text-dim);
+  font-size: 0.68rem;
+}
+
+.macro-map-space-button[aria-pressed="true"] {
+  border-color: var(--accent-ring);
+  background: var(--accent-soft);
+  color: var(--text-primary);
+}
+
+.macro-map-display-summary {
+  margin-left: auto;
+}
+
 .macro-map-fullscreen-toggle {
   flex: 0 0 auto;
+  gap: 0.35rem;
+}
+
+.macro-fullscreen-icon {
+  flex: 0 0 auto;
+  width: 0.9rem;
+  height: 0.9rem;
+}
+
+.macro-map-error {
+  flex: 0 0 auto;
+  max-height: 5rem;
+  padding: 0.45rem 0.6rem;
+  overflow: auto;
+  border: 1px solid color-mix(in srgb, var(--danger) 32%, transparent);
+  border-radius: var(--radius-sm);
+  background: color-mix(in srgb, var(--danger) 9%, var(--bg-elevated));
+  color: var(--danger);
+  font-size: 0.75rem;
+  overflow-wrap: anywhere;
 }
 
 .macro-visualization-fullscreen .macro-action-map {
@@ -995,7 +1160,7 @@ html.macro-map-fullscreen #root {
   }
 }
 
-@media (max-width: 820px) {
+@media (max-width: 690px) {
   .macro-target-row {
     grid-template-columns: minmax(0, 1fr) minmax(0, 1.5fr);
   }

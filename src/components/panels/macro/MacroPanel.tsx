@@ -3,6 +3,8 @@ import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import ConfirmDialog from "../../ConfirmDialog";
+import HotkeyCaptureInput from "../../HotkeyCaptureInput";
 import {
   AdvDropdown,
   CardDivider,
@@ -10,6 +12,7 @@ import {
 } from "../advanced/sections/shared";
 import MacroCodeEditor from "./MacroCodeEditor";
 import MacroVisualization from "./MacroVisualization";
+import MacroRunHotkeyInput from "./MacroRunHotkeyInput";
 import type { Settings } from "../../../store";
 import type {
   MacroProfile,
@@ -60,9 +63,8 @@ function directive(
   replacement: string,
 ) {
   const lines = source.split(/\r?\n/);
-  const index = lines.findIndex((line) =>
-    line.trimStart().startsWith(kind + " "),
-  );
+  const pattern = new RegExp("^" + kind + "\\b", "i");
+  const index = lines.findIndex((line) => pattern.test(line.trimStart()));
   if (index >= 0) lines[index] = replacement;
   else lines.unshift(replacement);
   return lines.join("\n");
@@ -75,6 +77,77 @@ function targetDirective(target: MacroTarget) {
   if (target.className.trim())
     parts.push("class=" + JSON.stringify(target.className));
   return parts.join(" ");
+}
+
+function targetOptionValue(target: Pick<MacroTarget, "hwnd" | "pid">) {
+  return `${target.hwnd}:${target.pid}`;
+}
+
+const HOTKEY_TOKEN_ALIASES: Record<string, string> = {
+  control: "ctrl",
+  option: "alt",
+  command: "super",
+  cmd: "super",
+  meta: "super",
+  win: "super",
+  lctrl: "leftctrl",
+  ctrlleft: "leftctrl",
+  rctrl: "rightctrl",
+  ctrlright: "rightctrl",
+  lalt: "leftalt",
+  altleft: "leftalt",
+  ralt: "rightalt",
+  altright: "rightalt",
+  altgr: "rightalt",
+  lshift: "leftshift",
+  shiftleft: "leftshift",
+  rshift: "rightshift",
+  shiftright: "rightshift",
+  lwin: "leftsuper",
+  leftwin: "leftsuper",
+  superleft: "leftsuper",
+  rwin: "rightsuper",
+  rightwin: "rightsuper",
+  superright: "rightsuper",
+};
+
+function hotkeyIdentity(value: string) {
+  return value
+    .split("+")
+    .map((token) => {
+      const normalized = token.trim().toLowerCase();
+      return HOTKEY_TOKEN_ALIASES[normalized] ?? normalized;
+    })
+    .filter(Boolean)
+    .sort()
+    .join("+");
+}
+
+function targetWindowSignature(targets: MacroTarget[]) {
+  return targets
+    .map((target) =>
+      [
+        targetOptionValue(target),
+        target.processName,
+        target.title,
+        target.className,
+        target.visible,
+        target.minimized,
+        target.clientWidth,
+        target.clientHeight,
+        target.dpi,
+      ].join("\u0000"),
+    )
+    .sort()
+    .join("\u0001");
+}
+
+function removeDirective(source: string, kind: "target" | "mode") {
+  const pattern = new RegExp("^" + kind + "\\b", "i");
+  return source
+    .split(/\r?\n/)
+    .filter((line) => !pattern.test(line.trimStart()))
+    .join("\n");
 }
 
 function updateProfile(
@@ -149,6 +222,7 @@ export default function MacroPanel({
   const [logEntries, setLogEntries] = useState<string[]>([]);
   const [targets, setTargets] = useState<MacroTarget[]>([]);
   const [targetCapabilities, setTargetCapabilities] = useState<string>("");
+  const refreshingTargetsRef = useRef(false);
   const [recordCursorMovement, setRecordCursorMovement] = useState(
     settings.recordCursorMovement,
   );
@@ -156,23 +230,39 @@ export default function MacroPanel({
     null,
   );
   const [recordedEvents, setRecordedEvents] = useState<RecorderEvent[]>([]);
+  const [recorderNotice, setRecorderNotice] = useState("");
   const [recordingCountdownSeconds, setRecordingCountdownSeconds] = useState(3);
   const [recordingCountdown, setRecordingCountdown] = useState<number | null>(
     null,
   );
+  const [preparingRecording, setPreparingRecording] = useState(false);
   const recordedEventsRef = useRef<RecorderEvent[]>([]);
   const recordedEventsRenderTimerRef = useRef<number | null>(null);
   const recordingCountdownTimerRef = useRef<number | null>(null);
+  const startingCountdownRef = useRef(false);
   const cancelRecordingCountdownRef = useRef<() => void>(() => {});
+  const targetProbeRequestRef = useRef(0);
   const [timelinePage, setTimelinePage] = useState<number | null>(null);
   const [recordingFinished, setRecordingFinished] = useState(false);
+  const [confirmation, setConfirmation] = useState<{
+    title: string;
+    message: string;
+    confirmLabel: string;
+    action: () => void;
+  } | null>(null);
   const [selectedTimelineIndex, setSelectedTimelineIndex] = useState<
     number | null
   >(null);
   const [pickCoordinateActive, setPickCoordinateActive] = useState(false);
   const macroContentRef = useRef<HTMLDivElement>(null);
+  const macroPanelMountedRef = useRef(true);
   const handleDraftChange = useCallback((value: string) => setDraft(value), []);
+  const clearTargetCapabilities = useCallback(() => {
+    targetProbeRequestRef.current += 1;
+    setTargetCapabilities("");
+  }, []);
   const lastStoppedSessionLoggedRef = useRef<string | null>(null);
+  const closedRecorderSessionRef = useRef<string | null>(null);
   const macroDraftRef = useRef({
     source: draft,
     name: draftName,
@@ -200,6 +290,8 @@ export default function MacroPanel({
   );
   const startingMacroRef = useRef(false);
   const startingRecordingRef = useRef(false);
+  const runningRef = useRef(running);
+  runningRef.current = running;
   const pendingRecordingStartRef = useRef<Promise<string> | null>(null);
   const recordingSessionRef = useRef<string | null>(recordingSessionId);
   recordingSessionRef.current = recordingSessionId;
@@ -227,6 +319,9 @@ export default function MacroPanel({
     (draftId !== activeProfile.id ||
       draft !== activeProfile.source ||
       draftName !== activeProfile.name);
+  const recorderNoticeIsError = /could not|failed|conflict/i.test(
+    recorderNotice,
+  );
   const editorErrors = useMemo(
     () =>
       validatedSource === draft && !validating
@@ -236,6 +331,33 @@ export default function MacroPanel({
   );
   const hasCurrentValidation = validatedSource === draft && !validating;
   const validationPending = Boolean(draft.trim()) && !hasCurrentValidation;
+  const runDiscardableAction = (action: () => void) => {
+    if (!isDirty) {
+      action();
+      return;
+    }
+    setConfirmation({
+      title: "Discard unsaved changes?",
+      message: "Your current macro edits will be discarded before continuing.",
+      confirmLabel: "Discard changes",
+      action,
+    });
+  };
+  const cancelConfirmation = useCallback(() => setConfirmation(null), []);
+  const confirmPendingAction = useCallback(() => {
+    if (!confirmation) return;
+    const action = confirmation.action;
+    setConfirmation(null);
+    action();
+  }, [confirmation]);
+
+  useEffect(() => {
+    macroPanelMountedRef.current = true;
+    return () => {
+      macroPanelMountedRef.current = false;
+      targetProbeRequestRef.current += 1;
+    };
+  }, []);
 
   useEffect(() => {
     onDirtyChange(isDirty);
@@ -244,11 +366,13 @@ export default function MacroPanel({
 
   useEffect(() => {
     if (!activeProfile || draftId === activeProfile.id) return;
+    clearTargetCapabilities();
     setDraftId(activeProfile.id);
     setDraft(activeProfile.source);
     setDraftName(activeProfile.name);
     setValidation(null);
-  }, [activeProfile, draftId]);
+    setValidatedSource(null);
+  }, [activeProfile, clearTargetCapabilities, draftId]);
 
   useEffect(() => {
     if (!draft.trim()) {
@@ -316,15 +440,18 @@ export default function MacroPanel({
   useEffect(() => {
     let disposed = false;
     const cleanups: Array<() => void> = [];
-    const addListener = async <T,>(
+    const listenerRegistrations: Array<Promise<void>> = [];
+    const addListener = <T,>(
       eventName: string,
       listener: (payload: T) => void,
     ) => {
-      const unlisten = await listen<T>(eventName, (event) =>
+      const registration = listen<T>(eventName, (event) =>
         listener(event.payload),
-      );
-      if (disposed) unlisten();
-      else cleanups.push(unlisten);
+      ).then((unlisten) => {
+        if (disposed) unlisten();
+        else cleanups.push(unlisten);
+      });
+      listenerRegistrations.push(registration);
     };
     void addListener<{ state: RuntimeState; steps?: number }>(
       "macro:state",
@@ -354,6 +481,24 @@ export default function MacroPanel({
     void addListener<{ sessionId: string; events: RecorderEvent[] }>(
       "recorder:events",
       (batch) => {
+        if (closedRecorderSessionRef.current === batch.sessionId) return;
+        if (lastStoppedSessionLoggedRef.current === batch.sessionId) return;
+        if (recordingSessionRef.current === null) {
+          // The worker may flush its first batch before the state event arrives.
+          if (recordedEventsRenderTimerRef.current !== null) {
+            window.clearTimeout(recordedEventsRenderTimerRef.current);
+            recordedEventsRenderTimerRef.current = null;
+          }
+          recordingSessionRef.current = batch.sessionId;
+          recordedEventsRef.current = [];
+          lastStoppedSessionLoggedRef.current = null;
+          setRecordingSessionId(batch.sessionId);
+          setRecordedEvents([]);
+          setTimelinePage(null);
+          setRecordingFinished(false);
+          setSelectedTimelineIndex(null);
+          setRuntimeState("Recording");
+        }
         if (recordingSessionRef.current !== batch.sessionId) return;
         recordedEventsRef.current.push(...batch.events);
         if (recordedEventsRenderTimerRef.current === null) {
@@ -364,32 +509,48 @@ export default function MacroPanel({
         }
       },
     );
-    void addListener<string>("recorder:warning", (message) =>
-      setLogEntries((current) => [message, ...current].slice(0, 100)),
-    );
+    void addListener<string>("recorder:warning", (message) => {
+      setRecorderNotice(message);
+      setLogEntries((current) => [message, ...current].slice(0, 100));
+    });
     void addListener<{
       state: string;
       sessionId?: string;
       recordCursorMovement?: boolean;
     }>("recorder:state", (event) => {
       if (event.state === "Recording") {
-        cancelRecordingCountdownRef.current();
-        if (recordedEventsRenderTimerRef.current !== null) {
-          window.clearTimeout(recordedEventsRenderTimerRef.current);
-          recordedEventsRenderTimerRef.current = null;
+        if (
+          event.sessionId &&
+          closedRecorderSessionRef.current === event.sessionId
+        ) {
+          return;
         }
+        setRecorderNotice("");
+        cancelRecordingCountdownRef.current();
+        const sameSession =
+          Boolean(event.sessionId) &&
+          recordingSessionRef.current === event.sessionId;
         recordingSessionRef.current = event.sessionId ?? "active";
-        recordedEventsRef.current = [];
-        lastStoppedSessionLoggedRef.current = null;
+        if (!sameSession) {
+          closedRecorderSessionRef.current = null;
+          if (recordedEventsRenderTimerRef.current !== null) {
+            window.clearTimeout(recordedEventsRenderTimerRef.current);
+            recordedEventsRenderTimerRef.current = null;
+          }
+          recordedEventsRef.current = [];
+          lastStoppedSessionLoggedRef.current = null;
+          setRecordedEvents([]);
+        }
         setRecordingSessionId(event.sessionId ?? null);
         setRuntimeState("Recording");
-        setRecordedEvents([]);
         setTimelinePage(null);
         setRecordingFinished(false);
         setSelectedTimelineIndex(null);
       } else if (event.state === "Stopped") {
+        if (event.sessionId) closedRecorderSessionRef.current = event.sessionId;
         if (
           event.sessionId &&
+          recordingSessionRef.current &&
           recordingSessionRef.current !== event.sessionId
         ) {
           return;
@@ -422,6 +583,7 @@ export default function MacroPanel({
       const shouldLogResult =
         lastStoppedSessionLoggedRef.current !== event.sessionId;
       lastStoppedSessionLoggedRef.current = event.sessionId;
+      closedRecorderSessionRef.current = event.sessionId;
       recordingSessionRef.current = null;
       recordedEventsRef.current = event.events;
       if (recordedEventsRenderTimerRef.current !== null) {
@@ -448,12 +610,30 @@ export default function MacroPanel({
       }
     });
     void addListener<string>("recorder:error", (message) => {
+      setRecorderNotice(message);
       setRuntimeState("Error");
       setLogEntries((current) => [message, ...current].slice(0, 100));
     });
+    // Enable the global shortcut only once the panel can receive its events.
+    void Promise.all(listenerRegistrations)
+      .then(() => {
+        if (disposed) return;
+        return invoke("set_macro_recorder_panel_active", { active: true });
+      })
+      .catch((err) => {
+        if (disposed) return;
+        console.error("Macro recorder listeners could not be registered:", err);
+        setRecorderNotice(
+          "Macro recording controls could not initialize. Reopen this panel and try again.",
+        );
+      });
     return () => {
       disposed = true;
       cleanups.forEach((cleanup) => cleanup());
+      void invoke("set_macro_recorder_panel_active", { active: false }).catch(
+        (err) =>
+          console.error("Macro recorder panel state could not sync:", err),
+      );
       if (recordedEventsRenderTimerRef.current !== null) {
         window.clearTimeout(recordedEventsRenderTimerRef.current);
         recordedEventsRenderTimerRef.current = null;
@@ -472,12 +652,6 @@ export default function MacroPanel({
       );
     }
   }, [running, paused, stopReason, runtimeState]);
-
-  useEffect(() => {
-    return () => {
-      if (pickCoordinateActive) void invoke("cancel_click_point_pick");
-    };
-  }, [pickCoordinateActive]);
 
   useEffect(
     () => () => {
@@ -548,88 +722,27 @@ export default function MacroPanel({
   }, [draft]);
 
   const selectProfile = (id: string) => {
-    if (isDirty && !window.confirm("Discard unsaved macro changes?")) return;
+    if (id === activeProfile?.id) return;
     const profile = settings.macroProfiles.find((item) => item.id === id);
     if (!profile) return;
-    update({ activeMacroId: id });
-    setDraftId(profile.id);
-    setDraft(profile.source);
-    setDraftName(profile.name);
-    setValidation(null);
-    setValidatedSource(null);
+    runDiscardableAction(() => {
+      update({ activeMacroId: id });
+      setDraftId(profile.id);
+      setDraft(profile.source);
+      setDraftName(profile.name);
+      setValidation(null);
+      setValidatedSource(null);
+      clearTargetCapabilities();
+    });
   };
 
   const createMacro = () => {
-    if (isDirty && !window.confirm("Discard unsaved macro changes?")) return;
-    const now = new Date().toISOString();
-    const profile: MacroProfile = {
-      id: makeId(),
-      name: "New Macro",
-      source: "mode foreground\n",
-      syntaxVersion: 1,
-      target: null,
-      createdAt: now,
-      updatedAt: now,
-    };
-    update({
-      macroProfiles: [...settings.macroProfiles, profile],
-      activeMacroId: profile.id,
-    });
-    setDraftId(profile.id);
-    setDraft(profile.source);
-    setDraftName(profile.name);
-    setValidation(null);
-  };
-
-  const duplicateMacro = () => {
-    if (!activeProfile) return;
-    const now = new Date().toISOString();
-    const copy: MacroProfile = {
-      ...activeProfile,
-      id: makeId(),
-      name: (activeProfile.name + " copy").slice(0, 80),
-      createdAt: now,
-      updatedAt: now,
-    };
-    update({
-      macroProfiles: [...settings.macroProfiles, copy],
-      activeMacroId: copy.id,
-    });
-    setDraftId(copy.id);
-    setDraft(copy.source);
-    setDraftName(copy.name);
-  };
-
-  const deleteMacro = () => {
-    if (!activeProfile) return;
-    if (!window.confirm("Delete “" + activeProfile.name + "”?")) return;
-    const profiles = settings.macroProfiles.filter(
-      (profile) => profile.id !== activeProfile.id,
-    );
-    const next = profiles[0];
-    update({ macroProfiles: profiles, activeMacroId: next?.id ?? null });
-    setDraftId(next?.id ?? "");
-    setDraft(next?.source ?? "");
-    setDraftName(next?.name ?? "");
-  };
-
-  const importMacro = async () => {
-    try {
-      const selected = await open({
-        multiple: false,
-        filters: [{ name: "Blur Macro Script", extensions: ["bms"] }],
-      });
-      if (typeof selected !== "string") return;
-      const source = await readTextFile(selected);
+    runDiscardableAction(() => {
       const now = new Date().toISOString();
       const profile: MacroProfile = {
         id: makeId(),
-        name:
-          selected
-            .split(/[\\/]/)
-            .pop()
-            ?.replace(/\.bms$/i, "") || "Imported Macro",
-        source,
+        name: "New Macro",
+        source: "mode foreground\n",
         syntaxVersion: 1,
         target: null,
         createdAt: now,
@@ -640,10 +753,89 @@ export default function MacroPanel({
         activeMacroId: profile.id,
       });
       setDraftId(profile.id);
-      setDraft(source);
+      setDraft(profile.source);
       setDraftName(profile.name);
       setValidation(null);
-      setView("editor");
+      clearTargetCapabilities();
+    });
+  };
+
+  const duplicateMacro = () => {
+    if (!activeProfile) return;
+    const now = new Date().toISOString();
+    const copy: MacroProfile = {
+      ...activeProfile,
+      id: makeId(),
+      name: `${(draftName.trim() || activeProfile.name).slice(0, 75)} copy`,
+      source: draft,
+      createdAt: now,
+      updatedAt: now,
+    };
+    update({
+      macroProfiles: [...settings.macroProfiles, copy],
+      activeMacroId: copy.id,
+    });
+    setDraftId(copy.id);
+    setDraft(copy.source);
+    setDraftName(copy.name);
+    clearTargetCapabilities();
+  };
+
+  const deleteMacro = () => {
+    if (!activeProfile) return;
+    const profileId = activeProfile.id;
+    setConfirmation({
+      title: "Delete macro?",
+      message: `Delete “${activeProfile.name}”? This action cannot be undone.${isDirty ? " Unsaved edits to this macro will also be discarded." : ""}`,
+      confirmLabel: "Delete",
+      action: () => {
+        const profiles = settings.macroProfiles.filter(
+          (profile) => profile.id !== profileId,
+        );
+        const next = profiles[0];
+        update({ macroProfiles: profiles, activeMacroId: next?.id ?? null });
+        setDraftId(next?.id ?? "");
+        setDraft(next?.source ?? "");
+        setDraftName(next?.name ?? "");
+        clearTargetCapabilities();
+      },
+    });
+  };
+
+  const importMacro = async () => {
+    try {
+      const selected = await open({
+        multiple: false,
+        filters: [{ name: "Blur Macro Script", extensions: ["bms"] }],
+      });
+      if (typeof selected !== "string") return;
+      const source = await readTextFile(selected);
+      runDiscardableAction(() => {
+        const now = new Date().toISOString();
+        const profile: MacroProfile = {
+          id: makeId(),
+          name:
+            selected
+              .split(/[\\/]/)
+              .pop()
+              ?.replace(/\.bms$/i, "") || "Imported Macro",
+          source,
+          syntaxVersion: 1,
+          target: null,
+          createdAt: now,
+          updatedAt: now,
+        };
+        update({
+          macroProfiles: [...settings.macroProfiles, profile],
+          activeMacroId: profile.id,
+        });
+        setDraftId(profile.id);
+        setDraft(source);
+        setDraftName(profile.name);
+        setValidation(null);
+        clearTargetCapabilities();
+        setView("editor");
+      });
     } catch (err) {
       setRuntimeState("Error");
       setLogEntries((current) =>
@@ -668,27 +860,86 @@ export default function MacroPanel({
     }
   };
 
-  const refreshTargets = async () => {
+  const refreshTargets = useCallback(async () => {
+    if (refreshingTargetsRef.current) return;
+    refreshingTargetsRef.current = true;
     try {
       const result = await invoke<MacroTarget[]>("list_target_windows");
-      setTargets(result);
+      if (!macroPanelMountedRef.current) return;
+      setTargets((current) =>
+        targetWindowSignature(current) === targetWindowSignature(result)
+          ? current
+          : result,
+      );
+      const selectedTarget = macroDraftRef.current.target;
+      if (
+        selectedTarget &&
+        !result.some(
+          (target) =>
+            targetOptionValue(target) === targetOptionValue(selectedTarget),
+        )
+      ) {
+        targetProbeRequestRef.current += 1;
+        setTargetCapabilities(
+          "This target window is no longer open. Choose another window or clear the selection.",
+        );
+      } else {
+        setTargetCapabilities((current) =>
+          current.startsWith("Window list unavailable:") ||
+          current.startsWith("This target window is no longer open.")
+            ? ""
+            : current,
+        );
+      }
     } catch (err) {
-      setTargetCapabilities("Window list unavailable: " + String(err));
+      if (macroPanelMountedRef.current)
+        setTargetCapabilities("Window list unavailable: " + String(err));
+    } finally {
+      refreshingTargetsRef.current = false;
     }
-  };
-
-  useEffect(() => {
-    void refreshTargets();
-    // Initial target discovery only; the Refresh button handles later changes.
   }, []);
 
-  const chooseTarget = async (hwnd: string) => {
-    const target = targets.find((item) => String(item.hwnd) === hwnd) ?? null;
-    if (!target || !activeProfile) return;
+  useEffect(() => {
+    if (!settings.macroHotkeyOverride) return;
+    void refreshTargets();
+    const refreshIfVisible = () => {
+      if (document.visibilityState === "visible") void refreshTargets();
+    };
+    const interval = window.setInterval(refreshIfVisible, 15_000);
+    window.addEventListener("focus", refreshIfVisible);
+    document.addEventListener("visibilitychange", refreshIfVisible);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refreshIfVisible);
+      document.removeEventListener("visibilitychange", refreshIfVisible);
+    };
+  }, [macroProfileId, refreshTargets, settings.macroHotkeyOverride]);
+
+  const chooseTarget = async (selection: string) => {
+    if (!activeProfile) return;
+    if (!selection) {
+      setDraft((current) => removeDirective(current, "target"));
+      updateProfile(settings, update, activeProfile, {
+        target: null,
+        updatedAt: new Date().toISOString(),
+      });
+      clearTargetCapabilities();
+      return;
+    }
+    const target =
+      targets.find(
+        (item) => `target:${targetOptionValue(item)}` === selection,
+      ) ?? null;
+    if (!target) return;
     setDraft((current) =>
       directive(current, "target", targetDirective(target)),
     );
-    updateProfile(settings, update, activeProfile, { target });
+    updateProfile(settings, update, activeProfile, {
+      target,
+      updatedAt: new Date().toISOString(),
+    });
+    const requestId = ++targetProbeRequestRef.current;
+    setTargetCapabilities("Checking target capabilities…");
     try {
       const capabilities = await invoke<{
         backend: string;
@@ -697,6 +948,7 @@ export default function MacroPanel({
         confirmedEffects: boolean;
         reason: string;
       }>("probe_target_window", { hwnd: target.hwnd });
+      if (targetProbeRequestRef.current !== requestId) return;
       setTargetCapabilities(
         capabilities.backend +
           ": " +
@@ -707,6 +959,7 @@ export default function MacroPanel({
           capabilities.reason,
       );
     } catch (err) {
+      if (targetProbeRequestRef.current !== requestId) return;
       setTargetCapabilities("Capability probe failed: " + String(err));
     }
   };
@@ -727,6 +980,7 @@ export default function MacroPanel({
     try {
       await invoke("start_macro_coordinate_pick");
     } catch (err) {
+      if (!macroPanelMountedRef.current) return;
       setPickCoordinateActive(false);
       setLogEntries((current) =>
         ["Coordinate picker failed: " + String(err), ...current].slice(0, 100),
@@ -734,8 +988,25 @@ export default function MacroPanel({
     }
   };
 
+  const macroExecutionLocked =
+    Boolean(recordingSessionId) ||
+    running ||
+    startingMacroRef.current ||
+    startingCountdownRef.current ||
+    runtimeState === "Recording";
+  const recorderBusy =
+    Boolean(recordingSessionId) ||
+    recordingCountdown !== null ||
+    startingCountdownRef.current ||
+    preparingRecording ||
+    startingRecordingRef.current ||
+    runtimeState === "Recording";
+
   const setMacroEnabled = (enabled: boolean) => {
-    if (!enabled && (recordingSessionId || running)) return;
+    if (!enabled && recordingCountdown !== null) {
+      cancelRecordingCountdownRef.current();
+    }
+    if (!enabled && macroExecutionLocked) return;
     if (!enabled && pickCoordinateActive) {
       setPickCoordinateActive(false);
       void invoke("cancel_click_point_pick").catch(() => {});
@@ -753,22 +1024,43 @@ export default function MacroPanel({
     let cleanup: (() => void) | undefined;
     let cleanupEnded: (() => void) | undefined;
     let disposed = false;
-    listen<{ x: number; y: number; continuePicking: boolean }>(
-      "macro-coordinate-picked",
-      (event) => {
-        setDraft(
-          (current) =>
-            current +
-            (current.endsWith("\n") || !current ? "" : "\n") +
-            "move x=" +
-            event.payload.x +
-            " y=" +
-            event.payload.y +
-            " space=screen\nclick button=left count=1 radius=0",
+    listen<{
+      kind: "click" | "drag";
+      button: "left" | "right";
+      startX: number;
+      startY: number;
+      endX: number;
+      endY: number;
+      points: { x: number; y: number; elapsedMs: number }[];
+    }>("macro-gesture-picked", (event) => {
+      const gesture = event.payload;
+      const lines =
+        gesture.kind === "click"
+          ? [
+              `move x=${gesture.endX} y=${gesture.endY} space=screen`,
+              `click button=${gesture.button} count=1 radius=0`,
+            ]
+          : [
+              `move x=${gesture.startX} y=${gesture.startY} space=screen`,
+              `mouse_down button=${gesture.button}`,
+              ...gesture.points.map((point, index) => {
+                const previousElapsed =
+                  index === 0 ? 0 : (gesture.points[index - 1]?.elapsedMs ?? 0);
+                const duration = Math.max(1, point.elapsedMs - previousElapsed);
+                return `move x=${point.x} y=${point.y} space=screen duration=${duration}ms`;
+              }),
+              `mouse_up button=${gesture.button}`,
+            ];
+      setDraft((current) => {
+        const base =
+          gesture.kind === "drag"
+            ? directive(current, "mode", "mode foreground")
+            : current;
+        return (
+          base + (base.endsWith("\n") || !base ? "" : "\n") + lines.join("\n")
         );
-        if (!event.payload.continuePicking) setPickCoordinateActive(false);
-      },
-    ).then((unlisten) => {
+      });
+    }).then((unlisten) => {
       if (disposed) unlisten();
       else cleanup = unlisten;
     });
@@ -787,6 +1079,15 @@ export default function MacroPanel({
   }, []);
 
   const startRecording = async () => {
+    if (startingMacroRef.current) {
+      cancelRecordingCountdownRef.current();
+      return;
+    }
+    if (runningRef.current) {
+      cancelRecordingCountdownRef.current();
+      setRuntimeState("Running");
+      return;
+    }
     if (startingRecordingRef.current || recordingSessionRef.current) return;
     startingRecordingRef.current = true;
     let pendingStart: Promise<string> | null = null;
@@ -796,6 +1097,7 @@ export default function MacroPanel({
     }
     recordedEventsRef.current = [];
     setRecordedEvents([]);
+    setRecorderNotice("");
     setTimelinePage(null);
     setRecordingFinished(false);
     setSelectedTimelineIndex(null);
@@ -806,11 +1108,14 @@ export default function MacroPanel({
       });
       pendingRecordingStartRef.current = pendingStart;
       const session = await pendingStart;
+      if (!macroPanelMountedRef.current) return;
       if (lastStoppedSessionLoggedRef.current !== session) {
         recordingSessionRef.current = session;
         setRecordingSessionId(session);
       }
     } catch (err) {
+      if (!macroPanelMountedRef.current) return;
+      setRecorderNotice("Recording could not start: " + String(err));
       setRuntimeState("Error");
       setLogEntries((current) =>
         ["Recording could not start: " + String(err), ...current].slice(0, 100),
@@ -832,32 +1137,72 @@ export default function MacroPanel({
   };
   cancelRecordingCountdownRef.current = cancelRecordingCountdown;
 
-  const beginRecordingCountdown = () => {
-    if (recordingCountdownTimerRef.current !== null) return;
-    const seconds = Math.max(
-      0,
-      Math.min(30, Math.trunc(recordingCountdownSeconds)),
-    );
-    if (seconds === 0) {
-      void startRecording();
+  const beginRecordingCountdown = async () => {
+    if (
+      runningRef.current ||
+      startingMacroRef.current ||
+      startingRecordingRef.current ||
+      recordingSessionRef.current ||
+      startingCountdownRef.current ||
+      recordingCountdownTimerRef.current !== null
+    )
       return;
-    }
-
-    const endAt = Date.now() + seconds * 1000;
-    setRecordingCountdown(seconds);
-    recordingCountdownTimerRef.current = window.setInterval(() => {
-      const remaining = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
-      if (remaining === 0) {
-        if (recordingCountdownTimerRef.current !== null) {
-          window.clearInterval(recordingCountdownTimerRef.current);
-          recordingCountdownTimerRef.current = null;
-        }
-        setRecordingCountdown(null);
+    startingCountdownRef.current = true;
+    setPreparingRecording(true);
+    setRecorderNotice("");
+    try {
+      if (pickCoordinateActive) {
+        setPickCoordinateActive(false);
+        await invoke("cancel_click_point_pick");
+        if (!macroPanelMountedRef.current) return;
+        if (
+          runningRef.current ||
+          startingMacroRef.current ||
+          startingRecordingRef.current ||
+          recordingSessionRef.current ||
+          recordingCountdownTimerRef.current !== null
+        )
+          return;
+      }
+      const seconds = Math.max(
+        0,
+        Math.min(30, Math.trunc(recordingCountdownSeconds)),
+      );
+      if (seconds === 0) {
         void startRecording();
         return;
       }
-      setRecordingCountdown(remaining);
-    }, 100);
+
+      const endAt = Date.now() + seconds * 1000;
+      setRecordingCountdown(seconds);
+      recordingCountdownTimerRef.current = window.setInterval(() => {
+        const remaining = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
+        if (remaining === 0) {
+          if (recordingCountdownTimerRef.current !== null) {
+            window.clearInterval(recordingCountdownTimerRef.current);
+            recordingCountdownTimerRef.current = null;
+          }
+          setRecordingCountdown(null);
+          void startRecording();
+          return;
+        }
+        setRecordingCountdown(remaining);
+      }, 100);
+    } catch (err) {
+      if (!macroPanelMountedRef.current) return;
+      setLogEntries((current) =>
+        [
+          "Could not stop Pick Point before recording: " + String(err),
+          ...current,
+        ].slice(0, 100),
+      );
+      setRecorderNotice(
+        "Could not stop Pick Point before recording: " + String(err),
+      );
+    } finally {
+      startingCountdownRef.current = false;
+      if (macroPanelMountedRef.current) setPreparingRecording(false);
+    }
   };
 
   useEffect(
@@ -870,6 +1215,10 @@ export default function MacroPanel({
     [],
   );
 
+  useEffect(() => {
+    if (running) cancelRecordingCountdownRef.current();
+  }, [running]);
+
   const stopRecording = async () => {
     if (!recordingSessionId) return;
     try {
@@ -879,6 +1228,7 @@ export default function MacroPanel({
         events: RecorderEvent[];
         sessionId: string;
       }>("recorder_stop", { sessionId: recordingSessionId });
+      if (!macroPanelMountedRef.current) return;
       const shouldLogResult =
         lastStoppedSessionLoggedRef.current !== result.sessionId;
       lastStoppedSessionLoggedRef.current = result.sessionId;
@@ -902,6 +1252,8 @@ export default function MacroPanel({
         );
       }
     } catch (err) {
+      if (!macroPanelMountedRef.current) return;
+      setRecorderNotice("Recording could not stop: " + String(err));
       setRuntimeState("Error");
       setLogEntries((current) =>
         ["Recording stop failed: " + String(err), ...current].slice(0, 100),
@@ -989,7 +1341,26 @@ export default function MacroPanel({
   };
 
   const startMacro = async () => {
-    if (startingMacroRef.current || !activeProfile) return;
+    if (pickCoordinateActive) {
+      setLogEntries((current) =>
+        ["Turn Pick Point off before running a macro.", ...current].slice(
+          0,
+          100,
+        ),
+      );
+      return;
+    }
+    if (
+      startingMacroRef.current ||
+      recordingSessionId ||
+      recordingSessionRef.current ||
+      startingRecordingRef.current ||
+      runtimeState === "Recording" ||
+      recordingCountdown !== null ||
+      recordingCountdownTimerRef.current !== null ||
+      !activeProfile
+    )
+      return;
     startingMacroRef.current = true;
     const sourceAtStart = draft;
     const nameAtStart = draftName;
@@ -1040,6 +1411,46 @@ export default function MacroPanel({
 
   const selectedTarget = activeProfile?.target;
   const backgroundMode = /^\s*mode\s+background/m.test(draft);
+  const selectedTargetIsAvailable =
+    selectedTarget !== null &&
+    selectedTarget !== undefined &&
+    targets.some(
+      (target) =>
+        targetOptionValue(target) === targetOptionValue(selectedTarget),
+    );
+  const targetDropdownValue = selectedTarget
+    ? selectedTargetIsAvailable
+      ? `target:${targetOptionValue(selectedTarget)}`
+      : `unavailable:${targetOptionValue(selectedTarget)}`
+    : "";
+  const targetOptions = [
+    { value: "", label: "Select a window…" },
+    ...(selectedTarget && !selectedTargetIsAvailable
+      ? [
+          {
+            value: `unavailable:${targetOptionValue(selectedTarget)}`,
+            label: `Unavailable — ${selectedTarget.processName}${selectedTarget.title ? ` · ${selectedTarget.title}` : ""}`,
+            disabled: true,
+          },
+        ]
+      : []),
+    ...targets.map((target) => ({
+      value: `target:${targetOptionValue(target)}`,
+      label: `${target.title} — ${target.processName} (PID ${target.pid})`,
+    })),
+  ];
+  const macroRunHotkeyConflicts = [
+    { label: "Clicker trigger", value: settings.hotkey },
+    { label: "Master hotkey", value: settings.keybindMaster },
+    { label: "Record hotkey", value: settings.recordingHotkey },
+    { label: "Emergency stop", value: settings.emergencyStopHotkey },
+  ];
+  const recordHotkeyConflicts = [
+    { label: "Clicker trigger", value: settings.hotkey },
+    { label: "Master hotkey", value: settings.keybindMaster },
+    { label: "Macro Hot Key", value: settings.macroRunHotkey },
+    { label: "Emergency stop", value: settings.emergencyStopHotkey },
+  ];
 
   return (
     <div className="adv-panel adv-panel-text macro-panel">
@@ -1050,7 +1461,7 @@ export default function MacroPanel({
               <InfoIcon
                 text={
                   settings.macroHotkeyOverride
-                    ? `${primaryHotkey || "Clicker trigger"} runs the active macro.`
+                    ? "The clicker trigger and any assigned Macro Hot Key run the active macro."
                     : "Turn Macro on to edit, record, and run macros."
                 }
               />
@@ -1065,11 +1476,7 @@ export default function MacroPanel({
                 type="button"
                 className={`adv-toggle-btn adv-toggle-off ${!settings.macroHotkeyOverride ? "active" : ""}`}
                 aria-pressed={!settings.macroHotkeyOverride}
-                disabled={
-                  Boolean(recordingSessionId) ||
-                  running ||
-                  !settings.macroHotkeyOverride
-                }
+                disabled={macroExecutionLocked || !settings.macroHotkeyOverride}
                 onClick={() => setMacroEnabled(false)}
               >
                 Off
@@ -1078,11 +1485,7 @@ export default function MacroPanel({
                 type="button"
                 className={`adv-toggle-btn adv-toggle-on ${settings.macroHotkeyOverride ? "active" : ""}`}
                 aria-pressed={settings.macroHotkeyOverride}
-                disabled={
-                  Boolean(recordingSessionId) ||
-                  running ||
-                  settings.macroHotkeyOverride
-                }
+                disabled={macroExecutionLocked || settings.macroHotkeyOverride}
                 onClick={() => setMacroEnabled(true)}
               >
                 On
@@ -1091,6 +1494,13 @@ export default function MacroPanel({
           </div>
           <CardDivider />
 
+          <MacroRunHotkeyInput
+            value={settings.macroRunHotkey}
+            conflicts={macroRunHotkeyConflicts}
+            disabled={macroExecutionLocked}
+            onChange={(macroRunHotkey) => update({ macroRunHotkey })}
+          />
+
           <div
             ref={macroContentRef}
             className={`macro-content ${settings.macroHotkeyOverride ? "" : "is-disabled"}`}
@@ -1098,12 +1508,11 @@ export default function MacroPanel({
           >
             {recordingSessionId && (
               <div
-                className="macro-recorder-warning"
+                className="macro-recorder-active"
                 role="status"
                 aria-live="polite"
               >
-                Recording is active. Keyboard input is captured locally;
-                password detection is best-effort.
+                Recording is active.
                 <button
                   className="adv-secondary-btn macro-button macro-button-danger"
                   onClick={() => void stopRecording()}
@@ -1125,27 +1534,26 @@ export default function MacroPanel({
                   }))}
                   hoverWheel={false}
                   onChange={selectProfile}
-                  disabled={
-                    !settings.macroHotkeyOverride || Boolean(recordingSessionId)
-                  }
+                  disabled={!settings.macroHotkeyOverride || recorderBusy}
                 />
                 <button
                   className="adv-secondary-btn macro-button"
                   onClick={createMacro}
-                  disabled={Boolean(recordingSessionId)}
+                  disabled={recorderBusy}
                 >
                   New
                 </button>
                 <button
                   className="adv-secondary-btn macro-button"
                   onClick={() => saveDraft()}
+                  disabled={recorderBusy}
                 >
                   Save
                 </button>
                 <button
                   className="adv-secondary-btn macro-button"
                   onClick={duplicateMacro}
-                  disabled={!activeProfile || Boolean(recordingSessionId)}
+                  disabled={!activeProfile || recorderBusy}
                 >
                   Duplicate
                 </button>
@@ -1155,7 +1563,7 @@ export default function MacroPanel({
                   disabled={
                     !activeProfile ||
                     settings.macroProfiles.length <= 1 ||
-                    Boolean(recordingSessionId)
+                    recorderBusy
                   }
                 >
                   Delete
@@ -1163,7 +1571,7 @@ export default function MacroPanel({
                 <button
                   className="adv-secondary-btn macro-button"
                   onClick={importMacro}
-                  disabled={Boolean(recordingSessionId)}
+                  disabled={recorderBusy}
                 >
                   Import
                 </button>
@@ -1186,41 +1594,39 @@ export default function MacroPanel({
                     value={draftName}
                     aria-label="Macro name"
                     maxLength={80}
+                    disabled={recorderBusy}
                     onChange={(event) => setDraftName(event.target.value)}
                     onBlur={() => {
-                      if (activeProfile && draftName !== activeProfile.name) {
+                      const normalizedName =
+                        draftName.trim().slice(0, 80) || "New Macro";
+                      setDraftName(normalizedName);
+                      if (
+                        activeProfile &&
+                        normalizedName !== activeProfile.name
+                      ) {
                         updateProfile(settings, update, activeProfile, {
-                          name: draftName.trim().slice(0, 80) || "New Macro",
+                          name: normalizedName,
+                          updatedAt: new Date().toISOString(),
                         });
                       }
                     }}
                   />
                 </label>
-                <label className="macro-target">
-                  <span>Target Window</span>
-                  <AdvDropdown
-                    className="macro-target-dropdown"
-                    portalClassName="macro-dropdown-menu"
-                    ariaLabel="Target Window"
-                    value={selectedTarget ? String(selectedTarget.hwnd) : ""}
-                    options={[
-                      { value: "", label: "Select a window…" },
-                      ...targets.map((target) => ({
-                        value: String(target.hwnd),
-                        label: `${target.title} — ${target.processName} (PID ${target.pid})`,
-                      })),
-                    ]}
-                    hoverWheel={false}
-                    disabled={!settings.macroHotkeyOverride}
-                    onChange={(hwnd) => void chooseTarget(hwnd)}
-                  />
-                </label>
-                <button
-                  className="adv-secondary-btn macro-button"
-                  onClick={() => void refreshTargets()}
-                >
-                  Refresh
-                </button>
+                <div className="macro-target">
+                  <span className="macro-target-label">Target Window</span>
+                  <div className="macro-target-control">
+                    <AdvDropdown
+                      className="macro-target-dropdown"
+                      portalClassName="macro-dropdown-menu"
+                      ariaLabel="Target Window"
+                      value={targetDropdownValue}
+                      options={targetOptions}
+                      hoverWheel={false}
+                      disabled={!settings.macroHotkeyOverride || recorderBusy}
+                      onChange={(hwnd) => void chooseTarget(hwnd)}
+                    />
+                  </div>
+                </div>
                 <label className="macro-mode">
                   <span>Mode</span>
                   <AdvDropdown
@@ -1233,7 +1639,7 @@ export default function MacroPanel({
                       { value: "background", label: "Background (strict)" },
                     ]}
                     hoverWheel={false}
-                    disabled={!settings.macroHotkeyOverride}
+                    disabled={!settings.macroHotkeyOverride || recorderBusy}
                     onChange={(mode) =>
                       chooseMode(mode as "foreground" | "background")
                     }
@@ -1280,13 +1686,14 @@ export default function MacroPanel({
                     </span>
                     <small>
                       {pickCoordinateActive
-                        ? "Right-click each location; press Esc or turn Pick Point off to finish."
-                        : "Pick coordinates to add move and click steps to the script."}
+                        ? "Outside this window, L/R-click adds clicks; hold and drag adds a foreground pan. Esc/Off stops."
+                        : "Outside this window, L/R-click adds clicks; hold and drag adds a pan."}
                     </small>
                   </div>
                   <button
                     className={`adv-secondary-btn macro-button ${pickCoordinateActive ? "macro-button-primary" : ""}`}
                     aria-pressed={pickCoordinateActive}
+                    disabled={recorderBusy || running}
                     onClick={() => void pickCoordinate()}
                   >
                     Pick Point {pickCoordinateActive ? "On" : "Off"}
@@ -1297,6 +1704,7 @@ export default function MacroPanel({
                     <MacroCodeEditor
                       value={draft}
                       errors={editorErrors}
+                      editable={!recorderBusy}
                       onChange={handleDraftChange}
                     />
                   </div>
@@ -1326,34 +1734,23 @@ export default function MacroPanel({
                             .join("  •  ")
                         : "Write a statement, then validate the script."}
                 </div>
-                <details className="macro-reference">
-                  <summary>Command guide and examples</summary>
-                  <div>
-                    <code>
-                      target process="app.exe" title_contains="Window"
-                    </code>
-                    <code>mode foreground</code>
-                    <code>move x=200 y=150 space=screen duration=100ms</code>
-                    <code>click button=left x=200 y=150 count=1 radius=0</code>
-                    <code>
-                      wait 250ms · repeat 3 {"{ … }"} · if ready == true{" "}
-                      {"{ … }"}
-                    </code>
-                    <code>key_down "CTRL" · press "CTRL+A" · type "Hello"</code>
-                    <code># Scripts are local; import never runs a macro.</code>
-                  </div>
-                </details>
               </section>
             )}
 
             {view === "record" && (
               <section className="macro-record-view">
-                <div className="macro-recorder-warning">
-                  Recording captures local keyboard and mouse actions only while
-                  active. Keyboard presses and releases are recorded
-                  automatically. Raw key names can reveal typed content;
-                  password detection is best-effort. Avoid sensitive input.
-                </div>
+                {recorderNotice && (
+                  <div
+                    className={
+                      "macro-recorder-status" +
+                      (recorderNoticeIsError ? " is-error" : "")
+                    }
+                    role={recorderNoticeIsError ? "alert" : "status"}
+                    aria-live={recorderNoticeIsError ? "assertive" : "polite"}
+                  >
+                    {recorderNotice}
+                  </div>
+                )}
                 <div className="macro-recorder-options">
                   <label className="macro-recorder-countdown">
                     <span>Start after</span>
@@ -1372,16 +1769,10 @@ export default function MacroPanel({
                             : 0,
                         );
                       }}
-                      disabled={
-                        Boolean(recordingSessionId) ||
-                        recordingCountdown !== null
-                      }
+                      disabled={recorderBusy}
                     />
                     <span>seconds</span>
                   </label>
-                  <span className="macro-recorder-feature">
-                    Keyboard capture on
-                  </span>
                 </div>
                 <label className="macro-recorder-mode">
                   <span>Mouse recording</span>
@@ -1397,11 +1788,7 @@ export default function MacroPanel({
                       },
                     ]}
                     hoverWheel={false}
-                    disabled={
-                      !settings.macroHotkeyOverride ||
-                      Boolean(recordingSessionId) ||
-                      recordingCountdown !== null
-                    }
+                    disabled={!settings.macroHotkeyOverride || recorderBusy}
                     onChange={(mode) => {
                       const enabled = mode === "all-movement";
                       setRecordCursorMovement(enabled);
@@ -1411,25 +1798,43 @@ export default function MacroPanel({
                   <small>
                     Drag mode records paths while holding the left, middle, or
                     right mouse button. The other mode also captures free cursor
-                    movement; clicks, scrolling, and keyboard actions are always
-                    recorded.
+                    movement; clicks and scrolling are always recorded.
                   </small>
                 </label>
                 <div className="macro-hotkey-settings">
-                  <label>
+                  <div className="macro-record-hotkey-setting">
                     <span>Record hotkey</span>
-                    <input
-                      aria-label="Recording hotkey"
+                    <HotkeyCaptureInput
+                      ariaLabel="Recording hotkey"
                       value={settings.recordingHotkey}
-                      onChange={(event) =>
-                        update({ recordingHotkey: event.target.value })
-                      }
-                      disabled={
-                        Boolean(recordingSessionId) ||
-                        recordingCountdown !== null
-                      }
+                      onChange={(recordingHotkey) => {
+                        const conflict = recordHotkeyConflicts.find(
+                          (item) =>
+                            item.value &&
+                            hotkeyIdentity(item.value) ===
+                              hotkeyIdentity(recordingHotkey),
+                        );
+                        if (conflict) {
+                          setRecorderNotice(
+                            `Could not set Record hotkey: already assigned to ${conflict.label}.`,
+                          );
+                          return;
+                        }
+                        setRecorderNotice("");
+                        update({ recordingHotkey });
+                      }}
+                      className="settings-keybind-capture macro-record-hotkey-capture"
+                      conflicts={recordHotkeyConflicts
+                        .filter(
+                          (item) =>
+                            item.value &&
+                            hotkeyIdentity(item.value) ===
+                              hotkeyIdentity(settings.recordingHotkey),
+                        )
+                        .map((item) => item.label)}
+                      editable={!recorderBusy}
                     />
-                  </label>
+                  </div>
                   <label>
                     <span>Emergency stop</span>
                     <input
@@ -1438,10 +1843,7 @@ export default function MacroPanel({
                       onChange={(event) =>
                         update({ emergencyStopHotkey: event.target.value })
                       }
-                      disabled={
-                        Boolean(recordingSessionId) ||
-                        recordingCountdown !== null
-                      }
+                      disabled={recorderBusy}
                     />
                   </label>
                 </div>
@@ -1463,10 +1865,13 @@ export default function MacroPanel({
                   ) : (
                     <button
                       className="adv-secondary-btn macro-button macro-button-primary"
-                      disabled={runtimeState === "Recording"}
-                      onClick={beginRecordingCountdown}
+                      disabled={
+                        running || startingMacroRef.current || recorderBusy
+                      }
+                      aria-busy={preparingRecording}
+                      onClick={() => void beginRecordingCountdown()}
                     >
-                      Start Recording
+                      {preparingRecording ? "Preparing…" : "Start Recording"}
                     </button>
                   )}
                   <span
@@ -1476,14 +1881,18 @@ export default function MacroPanel({
                         ? "Recording"
                         : recordingCountdown !== null
                           ? "Countdown"
-                          : runtimeState
+                          : preparingRecording
+                            ? "Preparing"
+                            : runtimeState
                     }
                   >
                     {recordingSessionId
                       ? "Recording"
                       : recordingCountdown !== null
                         ? "Starting in " + recordingCountdown + "s"
-                        : runtimeState}
+                        : preparingRecording
+                          ? "Preparing recorder…"
+                          : runtimeState}
                   </span>
                   <span>{recordedEvents.length} events</span>
                 </div>
@@ -1671,7 +2080,14 @@ export default function MacroPanel({
                   ) : (
                     <button
                       className="adv-secondary-btn macro-button macro-button-primary"
-                      disabled={Boolean(recordingSessionId) || !activeProfile}
+                      disabled={
+                        Boolean(recordingSessionId) ||
+                        recordingCountdown !== null ||
+                        startingRecordingRef.current ||
+                        runtimeState === "Recording" ||
+                        startingMacroRef.current ||
+                        !activeProfile
+                      }
                       onClick={() => void startMacro()}
                     >
                       Run · {primaryHotkey}
@@ -1709,6 +2125,14 @@ export default function MacroPanel({
           </div>
         </div>
       </div>
+      <ConfirmDialog
+        open={confirmation !== null}
+        title={confirmation?.title ?? ""}
+        message={confirmation?.message ?? ""}
+        confirmLabel={confirmation?.confirmLabel ?? "Confirm"}
+        onConfirm={confirmPendingAction}
+        onCancel={cancelConfirmation}
+      />
     </div>
   );
 }

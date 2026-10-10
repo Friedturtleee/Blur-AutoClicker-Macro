@@ -21,6 +21,7 @@ use crate::engine::worker::start_clicker_inner;
 use crate::engine::worker::stop_clicker_inner;
 use crate::hotkeys::register_hotkey_inner;
 use crate::hotkeys::register_master_inner;
+use crate::hotkeys::{format_hotkey_binding, parse_hotkey_binding};
 
 #[tauri::command]
 pub fn get_text_scale_factor() -> f64 {
@@ -140,6 +141,15 @@ pub fn get_status(app: AppHandle) -> AppResult<ClickerStatusPayload> {
 #[tauri::command]
 pub fn register_hotkey(app: AppHandle, hotkey: String) -> AppResult<String> {
     register_hotkey_inner(&app, hotkey)
+}
+
+#[tauri::command]
+pub fn normalize_hotkey_input(hotkey: String) -> AppResult<String> {
+    if hotkey.trim().is_empty() {
+        return Ok(String::new());
+    }
+    let binding = parse_hotkey_binding(&hotkey)?;
+    Ok(format_hotkey_binding(&binding))
 }
 
 #[tauri::command]
@@ -276,6 +286,15 @@ pub fn macro_set_context(
     selected_pid: Option<u32>,
 ) -> AppResult<()> {
     crate::macro_engine::set_macro_context(&app, active, source, selected_hwnd, selected_pid);
+    Ok(())
+}
+
+#[tauri::command]
+pub fn set_macro_recorder_panel_active(app: AppHandle, active: bool) -> AppResult<()> {
+    let state = app.state::<ClickerState>();
+    state
+        .macro_recorder_panel_active
+        .store(active, Ordering::SeqCst);
     Ok(())
 }
 

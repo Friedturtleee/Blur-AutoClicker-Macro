@@ -34,6 +34,7 @@ pub struct ClickerState {
     pub last_master_allowed: AtomicBool,
     pub settings_initialized: AtomicBool,
     pub macro_mode_active: AtomicBool,
+    pub macro_recorder_panel_active: AtomicBool,
     pub macro_source: Mutex<String>,
     pub macro_target_hwnd: Mutex<Option<u64>>,
     pub macro_target_pid: Mutex<Option<u32>>,

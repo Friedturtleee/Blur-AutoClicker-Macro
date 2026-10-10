@@ -392,7 +392,7 @@ export function AdvDropdown({
   portalClassName = "",
 }: {
   value: string;
-  options: readonly { value: string; label: string }[];
+  options: readonly { value: string; label: string; disabled?: boolean }[];
   onChange: (value: string) => void;
   hoverWheel?: boolean;
   allowWindowOverflow?: boolean;
@@ -403,6 +403,7 @@ export function AdvDropdown({
   portalClassName?: string;
 }) {
   const [open, setOpen] = useState(false);
+  const visibleOpen = open && !disabled;
   const [positioned, setPositioned] = useState(false);
   const [placement, setPlacement] = useState<"below" | "above">("below");
   const [pos, setPos] = useState({ top: 0, left: 0 });
@@ -410,8 +411,10 @@ export function AdvDropdown({
   const menuRef = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
-    if (disabled) setOpen(false);
-  }, [disabled]);
+    if (!disabled || !open) return;
+    const frame = window.requestAnimationFrame(() => setOpen(false));
+    return () => window.cancelAnimationFrame(frame);
+  }, [disabled, open]);
 
   const toggle = () => {
     if (disabled) return;
@@ -432,8 +435,8 @@ export function AdvDropdown({
     window.dispatchEvent(
       new CustomEvent("blur-dropdown-overflow", {
         detail: {
-          active: open,
-          bottom: open ? windowOverflowBottom : 0,
+          active: visibleOpen,
+          bottom: visibleOpen ? windowOverflowBottom : 0,
         },
       }),
     );
@@ -448,10 +451,10 @@ export function AdvDropdown({
         }),
       );
     };
-  }, [allowWindowOverflow, open, windowOverflowBottom]);
+  }, [allowWindowOverflow, visibleOpen, windowOverflowBottom]);
 
   useLayoutEffect(() => {
-    if (!open) return;
+    if (!visibleOpen) return;
 
     const updatePosition = () => {
       const trigger = ref.current;
@@ -485,10 +488,10 @@ export function AdvDropdown({
       window.removeEventListener("resize", updatePosition);
       window.removeEventListener("scroll", updatePosition, true);
     };
-  }, [open]);
+  }, [visibleOpen]);
 
   useEffect(() => {
-    if (!open) return;
+    if (!visibleOpen) return;
     const handleClick = (e: MouseEvent) => {
       const target = e.target as Node;
       if (
@@ -502,19 +505,22 @@ export function AdvDropdown({
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [open]);
+  }, [visibleOpen]);
 
   const handleWheel = (e: WheelEvent) => {
-    if (!hoverWheel || disabled || open) return;
+    if (!hoverWheel || disabled || visibleOpen) return;
     e.preventDefault();
     const currentIndex = options.findIndex((o) => o.value === value);
     if (currentIndex === -1) return;
     const direction = e.deltaY < 0 ? -1 : 1;
-    const nextIndex = Math.max(
-      0,
-      Math.min(options.length - 1, currentIndex + direction),
-    );
-    if (nextIndex !== currentIndex) {
+    let nextIndex = currentIndex;
+    while (true) {
+      const candidate = nextIndex + direction;
+      if (candidate < 0 || candidate >= options.length) break;
+      nextIndex = candidate;
+      if (!options[nextIndex].disabled) break;
+    }
+    if (nextIndex !== currentIndex && !options[nextIndex].disabled) {
       onChange(options[nextIndex].value);
     }
   };
@@ -532,7 +538,7 @@ export function AdvDropdown({
         className="adv-dropdown-trigger"
         aria-label={ariaLabel}
         aria-haspopup="listbox"
-        aria-expanded={open}
+        aria-expanded={visibleOpen}
         disabled={disabled}
         onClick={toggle}
       >
@@ -553,7 +559,7 @@ export function AdvDropdown({
           />
         </svg>
       </button>
-      {open &&
+      {visibleOpen &&
         createPortal(
           <div
             ref={menuRef}
@@ -578,7 +584,10 @@ export function AdvDropdown({
                 className={`adv-dropdown-item ${option.value === value ? "active" : ""}`}
                 role="option"
                 aria-selected={option.value === value}
+                aria-disabled={option.disabled || undefined}
+                disabled={option.disabled}
                 onClick={() => {
+                  if (option.disabled) return;
                   onChange(option.value);
                   setOpen(false);
                 }}

@@ -247,10 +247,8 @@ pub fn recorder_start(
             let mut events = Vec::new();
             let mut pending_ui_events = Vec::with_capacity(64);
             let mut last_ui_flush = Instant::now();
-            let mut password_warning_active = false;
             let mut event_limit_warning_active = false;
             let mut queue_warning_active = false;
-            let mut suppressed_sensitive_keys = std::collections::HashSet::new();
             let mut mouse_buttons_down = 0u32;
             let mut last_kept_move = None;
             loop {
@@ -283,32 +281,6 @@ pub fn recorder_start(
                     );
                 }
                 let Some(event) = message else { break };
-                if let RecordedKind::KeyDown { key } | RecordedKind::KeyUp { key } = &event.kind {
-                    let normalized_key = key.to_ascii_uppercase();
-                    let key_down = matches!(&event.kind, RecordedKind::KeyDown { .. });
-                    if key_down && suppressed_sensitive_keys.contains(&normalized_key) {
-                        continue;
-                    }
-                    if !key_down && suppressed_sensitive_keys.remove(&normalized_key) {
-                        continue;
-                    }
-                    if is_sensitive_edit_focused() {
-                        if key_down {
-                            suppressed_sensitive_keys.insert(normalized_key);
-                        }
-                        if !password_warning_active {
-                            password_warning_active = true;
-                            let _ = worker_control.app.emit(
-                                "recorder:warning",
-                            "Keyboard recording paused while a detectable password field has focus. Detection is best-effort.",
-                            );
-                        }
-                        continue;
-                    }
-                }
-                if password_warning_active {
-                    password_warning_active = false;
-                }
                 // Preserve the hook's monotonic timestamp. The event worker starts
                 // slightly later, so comparing these clocks would clip early actions.
                 if should_keep_event(
@@ -398,7 +370,6 @@ pub fn recorder_start(
             "state": "Recording",
             "sessionId": id,
             "recordCursorMovement": record_cursor_movement,
-            "privacyWarning": "Raw key names are captured locally. Password-field detection is best-effort; avoid recording sensitive input.",
         }),
     );
     Ok(id)
@@ -554,7 +525,9 @@ pub fn stop_recording_from_hotkey() {
     };
     std::thread::spawn(move || {
         if let Err(error) = finish_session(&control) {
-            log::warn!("[Recorder] Could not finish recording from hotkey: {error}");
+            let message = format!("Could not stop recording from the hotkey: {error}");
+            log::warn!("[Recorder] {message}");
+            let _ = control.app.emit("recorder:error", message);
         }
     });
 }
@@ -573,12 +546,35 @@ pub fn toggle_recording_from_hotkey(app: &tauri::AppHandle, record_cursor_moveme
     if !state
         .macro_mode_active
         .load(std::sync::atomic::Ordering::SeqCst)
+        || !state
+            .macro_recorder_panel_active
+            .load(std::sync::atomic::Ordering::SeqCst)
         || state.running.load(std::sync::atomic::Ordering::SeqCst)
     {
         return;
     }
+    // The event worker may have finished and cleared its session while the
+    // application state flag is still being reset. Ignore a repeat key during
+    // that short finalization window instead of reporting a false start error.
+    if state
+        .recording_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        return;
+    }
     if let Err(error) = recorder_start(app.clone(), record_cursor_movement) {
-        log::warn!("[Recorder] Could not start recording from hotkey: {error}");
+        let message = format!("Could not start recording from the hotkey: {error}");
+        log::warn!("[Recorder] {message}");
+        let _ = app.emit("recorder:error", message);
+    } else if !state
+        .macro_mode_active
+        .load(std::sync::atomic::Ordering::SeqCst)
+        || !state
+            .macro_recorder_panel_active
+            .load(std::sync::atomic::Ordering::SeqCst)
+    {
+        // The panel may have closed while Windows was installing its hooks.
+        stop_recording_from_hotkey();
     }
 }
 
@@ -640,6 +636,7 @@ fn should_keep_event(
             }
             true
         }
+        RecordedKind::KeyDown { .. } | RecordedKind::KeyUp { .. } => false,
         _ => true,
     }
 }
@@ -865,85 +862,16 @@ fn elapsed_hook_ms(route: &HookRoute) -> u64 {
 }
 
 #[cfg(windows)]
-fn is_sensitive_edit_focused() -> bool {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetClassNameW, GetForegroundWindow, GetGUIThreadInfo, GetWindowLongW,
-        GetWindowThreadProcessId, GUITHREADINFO, GWL_STYLE,
-    };
-    unsafe {
-        let foreground = GetForegroundWindow();
-        if foreground.is_null() {
-            return false;
-        }
-        let thread_id = GetWindowThreadProcessId(foreground, std::ptr::null_mut());
-        if thread_id == 0 {
-            return false;
-        }
-        let mut info: GUITHREADINFO = std::mem::zeroed();
-        info.cbSize = std::mem::size_of::<GUITHREADINFO>() as u32;
-        if GetGUIThreadInfo(thread_id, &mut info) == 0 || info.hwndFocus.is_null() {
-            return false;
-        }
-        let mut class = [0u16; 128];
-        let len = GetClassNameW(info.hwndFocus, class.as_mut_ptr(), class.len() as i32);
-        if len <= 0 || String::from_utf16_lossy(&class[..len as usize]) != "Edit" {
-            return false;
-        }
-        (GetWindowLongW(info.hwndFocus, GWL_STYLE) as u32 & 0x20) != 0
-    }
-}
-
-#[cfg(not(windows))]
-fn is_sensitive_edit_focused() -> bool {
-    false
-}
-
-#[cfg(windows)]
 fn run_hooks(control: Arc<RecorderControl>, ready: std::sync::mpsc::Sender<Result<(), String>>) {
     use std::ffi::c_void;
-    use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+    use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
     use windows_sys::Win32::System::Threading::GetCurrentThreadId;
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, SetWindowsHookExW,
-        TranslateMessage, UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
-        WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYUP, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-        WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
+        TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, MSLLHOOKSTRUCT, WH_MOUSE_LL,
+        WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL,
+        WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP,
     };
-
-    unsafe extern "system" fn keyboard_hook(
-        code: i32,
-        w_param: WPARAM,
-        l_param: LPARAM,
-    ) -> LRESULT {
-        if code >= 0 {
-            let data = &*(l_param as *const KBDLLHOOKSTRUCT);
-            if data.flags & 0x10 == 0 && data.dwExtraInfo != crate::engine::AUTOCLICKER_EXTRA_INFO {
-                let sender = hook_sender_for_callback();
-                if let Some(sender) = sender {
-                    let vk = data.vkCode as u16;
-                    let key = key_name(vk);
-                    if let Some(key) = key {
-                        let kind = if w_param as u32 == WM_KEYUP || w_param as u32 == 0x0105 {
-                            RecordedKind::KeyUp { key }
-                        } else {
-                            RecordedKind::KeyDown { key }
-                        };
-                        let event = RecordedEvent {
-                            at_ms: elapsed_hook_ms(&sender),
-                            kind,
-                        };
-                        enqueue_recorded_event(&sender, event);
-                    }
-                }
-            }
-        }
-        CallNextHookEx(
-            std::ptr::null_mut::<c_void>() as HHOOK,
-            code,
-            w_param,
-            l_param,
-        )
-    }
 
     unsafe extern "system" fn mouse_hook(code: i32, w_param: WPARAM, l_param: LPARAM) -> LRESULT {
         if code >= 0 {
@@ -1106,24 +1034,17 @@ fn run_hooks(control: Arc<RecorderControl>, ready: std::sync::mpsc::Sender<Resul
         }
     }
 
-    let keyboard: HHOOK =
-        unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_hook), std::ptr::null_mut(), 0) };
     let mouse: HHOOK =
         unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook), std::ptr::null_mut(), 0) };
-    if keyboard.is_null() || mouse.is_null() {
-        if !keyboard.is_null() {
-            unsafe { UnhookWindowsHookEx(keyboard) };
-        }
-        if !mouse.is_null() {
-            unsafe { UnhookWindowsHookEx(mouse) };
-        }
-        let _ = control.app.emit(
-            "recorder:error",
-            "Windows could not install the low-level recording hooks.",
-        );
-        let _ = ready.send(Err(
-            "Windows could not install the low-level recording hooks.".into(),
-        ));
+    let mouse_error = if mouse.is_null() {
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
+    if mouse.is_null() {
+        let _ = ready.send(Err(format!(
+            "Windows could not install the low-level mouse recording hook (system error {mouse_error})."
+        )));
     } else {
         let _ = ready.send(Ok(()));
         let mut message: MSG = unsafe { std::mem::zeroed() };
@@ -1139,83 +1060,12 @@ fn run_hooks(control: Arc<RecorderControl>, ready: std::sync::mpsc::Sender<Resul
             }
         }
         unsafe {
-            UnhookWindowsHookEx(keyboard);
             UnhookWindowsHookEx(mouse);
         }
     }
     RECORDER_HOOK_CONTEXT.with(|context| *context.borrow_mut() = None);
     clear_hook_sender_for(&control.id);
     let _ = control.sender.send(None);
-}
-
-#[cfg(windows)]
-fn key_name(vk: u16) -> Option<String> {
-    let name = match vk {
-        0x08 => "BACKSPACE",
-        0x09 => "TAB",
-        0x0D => "ENTER",
-        0x10 => "SHIFT",
-        0xA0 => "LEFTSHIFT",
-        0xA1 => "RIGHTSHIFT",
-        0x11 => "CTRL",
-        0xA2 => "LEFTCTRL",
-        0xA3 => "RIGHTCTRL",
-        0x12 => "ALT",
-        0xA4 => "LEFTALT",
-        0xA5 => "RIGHTALT",
-        0x13 => "PAUSE",
-        0x14 => "CAPSLOCK",
-        0x1B => "ESC",
-        0x20 => "SPACE",
-        0x21 => "PAGEUP",
-        0x22 => "PAGEDOWN",
-        0x23 => "END",
-        0x24 => "HOME",
-        0x25 => "LEFT",
-        0x26 => "UP",
-        0x27 => "RIGHT",
-        0x28 => "DOWN",
-        0x2C => "PRINTSCREEN",
-        0x2D => "INSERT",
-        0x2E => "DELETE",
-        0x5B => "LEFTWIN",
-        0x5C => "RIGHTWIN",
-        0x5D => "APPS",
-        0x5F => "SLEEP",
-        0x6A => "MULTIPLY",
-        0x6B => "ADD",
-        0x6C => "SEPARATOR",
-        0x6D => "SUBTRACT",
-        0x6E => "DECIMAL",
-        0x6F => "DIVIDE",
-        0x90 => "NUMLOCK",
-        0x91 => "SCROLLLOCK",
-        0xBA => ";",
-        0xBB => "=",
-        0xBC => ",",
-        0xBD => "-",
-        0xBE => ".",
-        0xBF => "/",
-        0xC0 => "BACKTICK",
-        0xDB => "[",
-        0xDC => "\\",
-        0xDD => "]",
-        0xDE => "'",
-        _ => "",
-    };
-    if !name.is_empty() {
-        return Some(name.to_string());
-    }
-    if (b'A' as u16..=b'Z' as u16).contains(&vk) || (b'0' as u16..=b'9' as u16).contains(&vk) {
-        return char::from_u32(vk as u32).map(|c| c.to_string());
-    }
-    if (0x60..=0x69).contains(&vk) {
-        return Some(format!("NUMPAD{}", vk - 0x60));
-    }
-    if (0x70..=0x87).contains(&vk) {
-        return Some(format!("F{}", vk - 0x70 + 1));
-    }
-    None
 }
 
 #[cfg(test)]
@@ -1332,6 +1182,40 @@ mod tests {
         assert!(source.contains("move x=640 y=360 space=screen\nmouse_down button=left"));
         assert!(source.contains("wait 60ms\nmouse_up button=left"));
         assert!(crate::macro_engine::validate_source(&source).ok);
+    }
+
+    #[test]
+    fn recorder_drops_keyboard_events() {
+        let mut buttons_down = 0;
+        let mut last_kept_move = None;
+
+        for kind in [
+            RecordedKind::KeyDown { key: "A".into() },
+            RecordedKind::KeyUp { key: "A".into() },
+        ] {
+            let keyboard_event = RecordedEvent { at_ms: 0, kind };
+            assert!(!should_keep_event(
+                &keyboard_event,
+                false,
+                &mut buttons_down,
+                &mut last_kept_move,
+            ));
+        }
+
+        let scroll_event = RecordedEvent {
+            at_ms: 25,
+            kind: RecordedKind::Scroll {
+                delta: -120,
+                x: 100,
+                y: 200,
+            },
+        };
+        assert!(should_keep_event(
+            &scroll_event,
+            false,
+            &mut buttons_down,
+            &mut last_kept_move,
+        ));
     }
 
     #[test]

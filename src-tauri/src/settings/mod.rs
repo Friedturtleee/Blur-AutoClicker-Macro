@@ -123,6 +123,8 @@ pub struct ClickerSettings {
     #[serde(default = "default_recording_hotkey")]
     pub recording_hotkey: String,
     #[serde(default)]
+    pub macro_run_hotkey: String,
+    #[serde(default)]
     pub macro_hotkey_override: bool,
     #[serde(default = "default_emergency_stop_hotkey")]
     pub emergency_stop_hotkey: String,
@@ -208,6 +210,7 @@ impl Default for ClickerSettings {
             task_switcher_stop_enabled: true,
             hotkey: "ctrl+y".to_string(),
             recording_hotkey: default_recording_hotkey(),
+            macro_run_hotkey: String::new(),
             macro_hotkey_override: false,
             emergency_stop_hotkey: default_emergency_stop_hotkey(),
             record_cursor_movement: true,

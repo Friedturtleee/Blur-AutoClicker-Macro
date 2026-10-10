@@ -548,18 +548,6 @@ mod win {
     }
 }
 
-#[cfg(test)]
-mod process_name_tests {
-    use super::process_name_matches;
-
-    #[test]
-    fn process_selector_accepts_optional_exe_suffix() {
-        assert!(process_name_matches("sample.exe", "sample"));
-        assert!(process_name_matches("sample.exe", "SAMPLE.EXE"));
-        assert!(!process_name_matches("sample.exe", "other"));
-    }
-}
-
 #[cfg(windows)]
 pub fn list_target_windows() -> Vec<TargetWindow> {
     win::list()
@@ -672,4 +660,16 @@ pub fn client_to_screen(hwnd: u64, x: i32, y: i32) -> Result<(i32, i32), String>
 #[cfg(not(windows))]
 pub fn client_to_screen(_hwnd: u64, x: i32, y: i32) -> Result<(i32, i32), String> {
     Err("Client coordinate conversion is only supported on Windows.".into())
+}
+
+#[cfg(test)]
+mod process_name_tests {
+    use super::process_name_matches;
+
+    #[test]
+    fn process_selector_accepts_optional_exe_suffix() {
+        assert!(process_name_matches("sample.exe", "sample"));
+        assert!(process_name_matches("sample.exe", "SAMPLE.EXE"));
+        assert!(!process_name_matches("sample.exe", "other"));
+    }
 }

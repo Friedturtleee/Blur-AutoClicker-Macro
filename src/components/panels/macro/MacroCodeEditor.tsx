@@ -1,5 +1,9 @@
-import type { Completion, CompletionContext } from "@codemirror/autocomplete";
-import { EditorState } from "@codemirror/state";
+import {
+  acceptCompletion,
+  type Completion,
+  type CompletionContext,
+} from "@codemirror/autocomplete";
+import { Compartment, EditorState, Prec } from "@codemirror/state";
 import {
   forceLinting,
   lintGutter,
@@ -7,8 +11,9 @@ import {
   type Diagnostic,
 } from "@codemirror/lint";
 import { indentUnit, syntaxHighlighting } from "@codemirror/language";
+import { indentMore } from "@codemirror/commands";
 import { basicSetup } from "codemirror";
-import { EditorView } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 import { memo, useEffect, useRef } from "react";
 import type { MacroValidation } from "../../../macro/types";
 import { bmsHighlightStyle, bmsLanguage } from "../../../macro/bmsLanguage";
@@ -16,6 +21,7 @@ import { bmsHighlightStyle, bmsLanguage } from "../../../macro/bmsLanguage";
 interface Props {
   value: string;
   errors: MacroValidation["errors"];
+  editable?: boolean;
   onChange: (value: string) => void;
 }
 
@@ -163,13 +169,19 @@ function toDiagnostics(
 const MacroCodeEditor = memo(function MacroCodeEditor({
   value,
   errors,
+  editable = true,
   onChange,
 }: Props) {
   const parentRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const initialValueRef = useRef(value);
+  const initialEditableRef = useRef(editable);
   const onChangeRef = useRef(onChange);
   const errorsRef = useRef(errors);
+  const editableCompartmentRef = useRef<Compartment | null>(null);
+  if (editableCompartmentRef.current === null) {
+    editableCompartmentRef.current = new Compartment();
+  }
 
   useEffect(() => {
     if (!parentRef.current) return;
@@ -178,7 +190,20 @@ const MacroCodeEditor = memo(function MacroCodeEditor({
       state: EditorState.create({
         doc: initialValueRef.current,
         extensions: [
+          Prec.highest(
+            keymap.of([
+              {
+                key: "Tab",
+                run: (editor) => acceptCompletion(editor) || indentMore(editor),
+              },
+              { key: "Enter", run: acceptCompletion },
+            ]),
+          ),
           basicSetup,
+          editableCompartmentRef.current!.of([
+            EditorView.editable.of(initialEditableRef.current),
+            EditorState.readOnly.of(!initialEditableRef.current),
+          ]),
           bmsLanguage,
           syntaxHighlighting(bmsHighlightStyle),
           bmsLanguage.data.of({ autocomplete: bmsCompletions }),
@@ -250,6 +275,17 @@ const MacroCodeEditor = memo(function MacroCodeEditor({
   }, []);
 
   useEffect(() => {
+    const view = viewRef.current;
+    if (!view) return;
+    view.dispatch({
+      effects: editableCompartmentRef.current!.reconfigure([
+        EditorView.editable.of(editable),
+        EditorState.readOnly.of(!editable),
+      ]),
+    });
+  }, [editable]);
+
+  useEffect(() => {
     onChangeRef.current = onChange;
     const view = viewRef.current;
     if (!view || view.state.doc.toString() === value) return;
@@ -263,7 +299,14 @@ const MacroCodeEditor = memo(function MacroCodeEditor({
     if (viewRef.current) forceLinting(viewRef.current);
   }, [errors]);
 
-  return <div className="macro-editor-codemirror" ref={parentRef} />;
+  return (
+    <div
+      className="macro-editor-codemirror"
+      ref={parentRef}
+      aria-disabled={!editable}
+      title={editable ? undefined : "Editor locked while recording."}
+    />
+  );
 });
 
 export default MacroCodeEditor;

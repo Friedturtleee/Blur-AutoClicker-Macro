@@ -109,6 +109,15 @@ function signed32Option(line: string, name: string): number | undefined {
     : undefined;
 }
 
+function defaultCoordinateSpace(
+  command: string,
+  hasCoordinates: boolean,
+  cursor: CursorPosition | null,
+): CoordinateSpace {
+  if (command === "move" || hasCoordinates) return "screen";
+  return cursor?.space ?? "screen";
+}
+
 function stringOption(line: string, name: string, fallback: string): string {
   const pattern = STRING_OPTION_PATTERNS[name];
   const match = pattern ? line.match(pattern) : null;
@@ -168,15 +177,20 @@ export function buildMacroVisualization(source: string): MacroVisualization {
         const explicitY = signed32Option(line, "y");
         const hasCoordinates =
           explicitX !== undefined && explicitY !== undefined;
-        const defaultSpace =
-          command === "move" || hasCoordinates
-            ? "screen"
-            : (cursor?.space ?? "screen");
-        const space = stringOption(
+        const defaultSpace = defaultCoordinateSpace(
+          command,
+          hasCoordinates,
+          cursor,
+        );
+        const requestedSpace: string = stringOption(
           line,
           "space",
           defaultSpace,
-        ) as CoordinateSpace;
+        ).toLowerCase();
+        const space: CoordinateSpace =
+          requestedSpace === "screen" || requestedSpace === "client"
+            ? requestedSpace
+            : defaultSpace;
         const position = hasCoordinates
           ? { x: explicitX, y: explicitY, space }
           : cursor?.space === space
@@ -199,7 +213,7 @@ export function buildMacroVisualization(source: string): MacroVisualization {
             cursor = { x: explicitX, y: explicitY, space };
           }
         } else if (command === "click") {
-          const button = stringOption(line, "button", "left");
+          const button = stringOption(line, "button", "left").toLowerCase();
           const count = integerOption(line, "count") ?? 1;
           const radius = integerOption(line, "radius") ?? 0;
           if (

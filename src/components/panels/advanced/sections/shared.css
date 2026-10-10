@@ -237,7 +237,7 @@ input[type="number"]::-webkit-outer-spin-button {
 
 .adv-toggle-off.active {
   background: var(--bg-input);
-  color: #a33c3c;
+  color: var(--accent-red);
 }
 
 .adv-toggle-btn.adv-disabled {
@@ -491,6 +491,14 @@ input[type="number"]::-webkit-outer-spin-button {
 .adv-dropdown-item.active {
   color: var(--text-primary);
   background: var(--bg-input);
+}
+
+.adv-dropdown-item:disabled,
+.adv-dropdown-item:disabled:hover,
+.adv-dropdown-item:disabled.active {
+  color: var(--text-dim);
+  background: transparent;
+  cursor: not-allowed;
 }
 
 .adv-hotkey-edit-btn {

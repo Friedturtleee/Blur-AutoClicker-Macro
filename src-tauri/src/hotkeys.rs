@@ -476,6 +476,7 @@ pub fn start_hotkey_listener(app: AppHandle) {
         let mut master_was_pressed = false;
         let mut emergency_was_pressed = false;
         let mut recorder_was_pressed = false;
+        let mut macro_was_pressed = false;
         let mut last_check = Instant::now();
         let mut msg: MSG = std::mem::zeroed();
 
@@ -489,7 +490,15 @@ pub fn start_hotkey_listener(app: AppHandle) {
             if last_check.elapsed() >= POLL_INTERVAL {
                 last_check = Instant::now();
 
-                let (binding, strict, emergency_hotkey, recording_hotkey, record_cursor) = {
+                let (
+                    binding,
+                    strict,
+                    emergency_hotkey,
+                    recording_hotkey,
+                    macro_run_hotkey,
+                    macro_hotkey_enabled,
+                    record_cursor,
+                ) = {
                     let binding = state
                         .registered_hotkey
                         .lock()
@@ -506,6 +515,8 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         strict,
                         settings.emergency_stop_hotkey.clone(),
                         settings.recording_hotkey.clone(),
+                        settings.macro_run_hotkey.clone(),
+                        settings.macro_hotkey_override,
                         settings.record_cursor_movement,
                     )
                 };
@@ -576,6 +587,51 @@ pub fn start_hotkey_listener(app: AppHandle) {
                 }
 
                 let emergency_binding = parse_hotkey_binding(&emergency_hotkey).ok();
+                let recording_binding = parse_hotkey_binding(&recording_hotkey).ok();
+                let recording_active = state.recording_active.load(Ordering::SeqCst);
+                let macro_binding = if macro_run_hotkey.trim().is_empty() {
+                    None
+                } else {
+                    parse_hotkey_binding(&macro_run_hotkey).ok()
+                };
+                let macro_hotkey_conflicts = macro_binding.as_ref().is_some_and(|candidate| {
+                    binding.as_ref().is_some_and(|other| other == candidate)
+                        || master_binding
+                            .as_ref()
+                            .is_some_and(|other| other == candidate)
+                        || emergency_binding
+                            .as_ref()
+                            .is_some_and(|other| other == candidate)
+                        || recording_binding
+                            .as_ref()
+                            .is_some_and(|other| other == candidate)
+                });
+                let macro_key_pressed = macro_binding
+                    .as_ref()
+                    .map(|candidate| hotkey_is_pressed(candidate, strict, running))
+                    .unwrap_or(false);
+                let recorder_conflicts = binding
+                    .as_ref()
+                    .zip(recording_binding.as_ref())
+                    .is_some_and(|(a, b)| a == b)
+                    || master_binding
+                        .as_ref()
+                        .zip(recording_binding.as_ref())
+                        .is_some_and(|(a, b)| a == b)
+                    || emergency_binding
+                        .as_ref()
+                        .zip(recording_binding.as_ref())
+                        .is_some_and(|(a, b)| a == b)
+                    || macro_binding
+                        .as_ref()
+                        .zip(recording_binding.as_ref())
+                        .is_some_and(|(a, b)| a == b);
+                let recording_key_pressed = recording_binding
+                    .as_ref()
+                    .map(|candidate| hotkey_is_pressed(candidate, strict, false))
+                    .unwrap_or(false);
+                let recorder_was_pressed_before = recorder_was_pressed;
+                recorder_was_pressed = recording_key_pressed;
                 let emergency_pressed = emergency_binding
                     .as_ref()
                     .map(|candidate| hotkey_is_pressed(candidate, strict, running))
@@ -591,6 +647,21 @@ pub fn start_hotkey_listener(app: AppHandle) {
                 if emergency_pressed {
                     was_pressed = false;
                     was_suppressed = false;
+                    macro_was_pressed = macro_key_pressed;
+                    continue;
+                }
+
+                // Stopping an active recording must remain available even
+                // while a settings capture or another picker owns keyboard input.
+                if recording_hotkey_should_stop(
+                    recording_key_pressed,
+                    recorder_was_pressed_before,
+                    recording_active,
+                ) {
+                    crate::recorder::stop_recording_from_hotkey();
+                    was_pressed = false;
+                    was_suppressed = false;
+                    macro_was_pressed = macro_key_pressed;
                     continue;
                 }
 
@@ -619,39 +690,41 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         }
                     }
                     was_pressed = currently_pressed;
+                    macro_was_pressed = macro_key_pressed;
                     continue;
                 }
 
-                let recording_binding = parse_hotkey_binding(&recording_hotkey).ok();
-                let recorder_conflicts = binding
-                    .as_ref()
-                    .zip(recording_binding.as_ref())
-                    .is_some_and(|(a, b)| a == b)
-                    || emergency_binding
-                        .as_ref()
-                        .zip(recording_binding.as_ref())
-                        .is_some_and(|(a, b)| a == b);
-                let recording_pressed = if running || recorder_conflicts {
-                    false
-                } else {
-                    recording_binding
-                        .as_ref()
-                        .map(|candidate| hotkey_is_pressed(candidate, strict, false))
-                        .unwrap_or(false)
-                };
-                if recording_pressed && !recorder_was_pressed {
+                let recorder_panel_active =
+                    state.macro_recorder_panel_active.load(Ordering::SeqCst);
+                let macro_mode_active = state.macro_mode_active.load(Ordering::SeqCst);
+                // The Macro panel owns recorder event listeners; do not start a
+                // global recording session while that UI is not mounted. Keep
+                // sampling the physical chord above so enabling the panel while
+                // the key is held cannot trigger a stale press. An active session
+                // must remain stoppable even if the panel is closing or Macro is
+                // being turned off.
+                let recording_pressed = recording_hotkey_is_enabled(
+                    recording_key_pressed,
+                    recording_active,
+                    recorder_conflicts,
+                    running,
+                    recorder_panel_active,
+                    macro_mode_active,
+                );
+                if recording_pressed && !recorder_was_pressed_before {
                     crate::recorder::toggle_recording_from_hotkey(&app, record_cursor);
                 }
-                recorder_was_pressed = recording_pressed;
                 if recording_pressed {
                     was_pressed = false;
                     was_suppressed = false;
+                    macro_was_pressed = macro_key_pressed;
                     continue;
                 }
 
                 if suppress_until_release {
                     if currently_pressed {
                         was_pressed = true;
+                        macro_was_pressed = macro_key_pressed;
                         continue;
                     }
                     state
@@ -659,13 +732,37 @@ pub fn start_hotkey_listener(app: AppHandle) {
                         .store(false, Ordering::SeqCst);
                     was_pressed = false;
                     was_suppressed = false;
+                    macro_was_pressed = macro_key_pressed;
                     continue;
                 }
 
                 if now_epoch_ms() < suppress_until {
                     was_pressed = currently_pressed;
+                    macro_was_pressed = macro_key_pressed;
                     continue;
                 }
+
+                if macro_hotkey_enabled
+                    && !macro_hotkey_conflicts
+                    && macro_key_pressed
+                    && !macro_was_pressed
+                {
+                    if state.running.load(Ordering::SeqCst) {
+                        if state.active_job_is_macro.load(Ordering::SeqCst) {
+                            if let Err(error) = stop_clicker_inner(
+                                &app,
+                                Some(String::from("Stopped from Macro hotkey")),
+                            ) {
+                                log::error!("[Macro hotkey] Stop failed: {error}");
+                            }
+                        }
+                    } else if !state.recording_active.load(Ordering::SeqCst) {
+                        if let Err(error) = crate::macro_engine::start_macro_inner(&app) {
+                            log::error!("[Macro hotkey] Start failed: {error}");
+                        }
+                    }
+                }
+                macro_was_pressed = macro_key_pressed;
 
                 let suppress_mouse_on_own_window =
                     binding.as_ref().is_some_and(is_mouse_hotkey_binding)
@@ -713,6 +810,27 @@ fn hotkey_is_pressed(binding: &HotkeyBinding, strict: bool, running: bool) -> bo
     } else {
         is_hotkey_binding_pressed(binding, strict)
     }
+}
+
+fn recording_hotkey_is_enabled(
+    key_pressed: bool,
+    recording_active: bool,
+    recorder_conflicts: bool,
+    running: bool,
+    recorder_panel_active: bool,
+    macro_mode_active: bool,
+) -> bool {
+    key_pressed
+        && (recording_active
+            || (!recorder_conflicts && !running && recorder_panel_active && macro_mode_active))
+}
+
+fn recording_hotkey_should_stop(
+    key_pressed: bool,
+    was_pressed: bool,
+    recording_active: bool,
+) -> bool {
+    key_pressed && !was_pressed && recording_active
 }
 
 fn is_mouse_hotkey_binding(binding: &HotkeyBinding) -> bool {
@@ -1135,8 +1253,34 @@ fn parse_function_key_token(token: &str) -> Option<(i32, String)> {
 mod tests {
     use super::{
         format_hotkey_binding, is_mouse_hotkey_binding, modifiers_match, parse_hotkey_binding,
-        DownState,
+        recording_hotkey_is_enabled, recording_hotkey_should_stop, DownState,
     };
+
+    #[test]
+    fn record_hotkey_stops_an_active_session_after_macro_panel_closes() {
+        assert!(recording_hotkey_is_enabled(
+            true, true, true, true, false, false
+        ));
+        assert!(recording_hotkey_should_stop(true, false, true));
+        assert!(!recording_hotkey_should_stop(true, true, true));
+        assert!(!recording_hotkey_should_stop(true, false, false));
+    }
+
+    #[test]
+    fn record_hotkey_starts_only_when_macro_panel_is_open_and_idle() {
+        assert!(recording_hotkey_is_enabled(
+            true, false, false, false, true, true
+        ));
+        assert!(!recording_hotkey_is_enabled(
+            true, false, false, true, true, true
+        ));
+        assert!(!recording_hotkey_is_enabled(
+            true, false, false, false, false, true
+        ));
+        assert!(!recording_hotkey_is_enabled(
+            false, false, false, false, true, true
+        ));
+    }
 
     #[test]
     fn numpad_tokens_round_trip() {

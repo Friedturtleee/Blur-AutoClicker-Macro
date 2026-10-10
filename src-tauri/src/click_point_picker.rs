@@ -2,16 +2,17 @@ use std::sync::{mpsc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
-use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::System::Threading::{GetCurrentProcessId, GetCurrentThreadId};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, VK_CONTROL, VK_ESCAPE, VK_SHIFT,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-    WM_SYSKEYDOWN,
+    CallNextHookEx, GetAncestor, GetMessageW, GetWindowThreadProcessId, PeekMessageW,
+    PostThreadMessageW, SetWindowsHookExW, UnhookWindowsHookEx, WindowFromPoint, GA_ROOT, HHOOK,
+    KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL, WM_KEYDOWN,
+    WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDBLCLK,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::engine::mouse::{current_virtual_screen_rect, VirtualScreenRect};
@@ -21,6 +22,8 @@ use crate::error::AppResult;
 use crate::ClickerState;
 
 const CURSOR_EMIT_INTERVAL: Duration = Duration::from_millis(16);
+const MACRO_DRAG_THRESHOLD_SQUARED: i64 = 16;
+const MAX_MACRO_DRAG_POINTS: usize = 5_000;
 
 #[derive(Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -35,6 +38,52 @@ struct ClickPointPickedPayload {
 struct ClickPointDeleteRequestedPayload {
     x: i32,
     y: i32,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MacroMouseButton {
+    Left,
+    Right,
+}
+
+impl MacroMouseButton {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Left => "left",
+            Self::Right => "right",
+        }
+    }
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MacroGesturePoint {
+    x: i32,
+    y: i32,
+    elapsed_ms: u64,
+}
+
+#[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct MacroGesturePickedPayload {
+    kind: &'static str,
+    button: &'static str,
+    start_x: i32,
+    start_y: i32,
+    end_x: i32,
+    end_y: i32,
+    points: Vec<MacroGesturePoint>,
+}
+
+struct MacroGestureCapture {
+    button: MacroMouseButton,
+    start_x: i32,
+    start_y: i32,
+    started_at: Instant,
+    last_sample_at: Instant,
+    max_distance_squared: i64,
+    furthest_point: MacroGesturePoint,
+    points: Vec<MacroGesturePoint>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -69,6 +118,8 @@ struct PickerRuntime {
     purpose: PickerPurpose,
     last_cursor_emit: Option<Instant>,
     stop_after_right_up: bool,
+    macro_gesture: Option<MacroGestureCapture>,
+    passthrough_button: Option<MacroMouseButton>,
 }
 
 unsafe impl Send for PickerRuntime {}
@@ -142,6 +193,8 @@ fn start_coordinate_picker(app: AppHandle, purpose: PickerPurpose) -> AppResult<
         runtime.purpose = purpose;
         runtime.last_cursor_emit = None;
         runtime.stop_after_right_up = false;
+        runtime.macro_gesture = None;
+        runtime.passthrough_button = None;
         runtime.generation
     };
 
@@ -290,6 +343,8 @@ fn stop_click_point_pick(
         runtime.app = None;
         runtime.last_cursor_emit = None;
         runtime.stop_after_right_up = false;
+        runtime.macro_gesture = None;
+        runtime.passthrough_button = None;
         (app, thread_id)
     };
 
@@ -319,6 +374,145 @@ fn clear_picker_thread_id(thread_id: u32) {
     }
 }
 
+fn is_cursor_over_own_window(x: i32, y: i32) -> bool {
+    unsafe {
+        let hwnd = WindowFromPoint(POINT { x, y });
+        if hwnd.is_null() {
+            return false;
+        }
+        let root = GetAncestor(hwnd, GA_ROOT);
+        let root = if root.is_null() { hwnd } else { root };
+        let mut pid = 0;
+        GetWindowThreadProcessId(root, &mut pid);
+        pid == GetCurrentProcessId()
+    }
+}
+
+// Returns true when the picker owns and should swallow this button press.
+fn begin_macro_gesture(button: MacroMouseButton, x: i32, y: i32) -> bool {
+    let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+    if !runtime.active || runtime.purpose != PickerPurpose::MacroCoordinate {
+        return false;
+    }
+    if runtime.macro_gesture.is_some() {
+        return true;
+    }
+    if is_cursor_over_own_window(x, y) {
+        runtime.passthrough_button = Some(button);
+        return false;
+    }
+
+    let now = Instant::now();
+    runtime.macro_gesture = Some(MacroGestureCapture {
+        button,
+        start_x: x,
+        start_y: y,
+        started_at: now,
+        last_sample_at: now,
+        max_distance_squared: 0,
+        furthest_point: MacroGesturePoint {
+            x,
+            y,
+            elapsed_ms: 0,
+        },
+        points: Vec::new(),
+    });
+    true
+}
+
+fn record_macro_gesture_position(runtime: &mut PickerRuntime, x: i32, y: i32, now: Instant) {
+    if !runtime.active || runtime.purpose != PickerPurpose::MacroCoordinate {
+        return;
+    }
+    let Some(capture) = runtime.macro_gesture.as_mut() else {
+        return;
+    };
+
+    let elapsed_ms = now.duration_since(capture.started_at).as_millis() as u64;
+    let dx = i64::from(x) - i64::from(capture.start_x);
+    let dy = i64::from(y) - i64::from(capture.start_y);
+    let distance_squared = dx.saturating_mul(dx).saturating_add(dy.saturating_mul(dy));
+    if distance_squared > capture.max_distance_squared {
+        capture.max_distance_squared = distance_squared;
+        capture.furthest_point = MacroGesturePoint { x, y, elapsed_ms };
+    }
+
+    let last_point = capture
+        .points
+        .last()
+        .map(|point| (point.x, point.y))
+        .unwrap_or((capture.start_x, capture.start_y));
+    if capture.points.len() < MAX_MACRO_DRAG_POINTS
+        && (x, y) != last_point
+        && now.duration_since(capture.last_sample_at) >= CURSOR_EMIT_INTERVAL
+    {
+        capture.points.push(MacroGesturePoint { x, y, elapsed_ms });
+        capture.last_sample_at = now;
+    }
+}
+
+// Returns true when the matching release was captured by the picker.
+fn finish_macro_gesture(button: MacroMouseButton, x: i32, y: i32) -> bool {
+    let (app, payload) = {
+        let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+        if runtime.passthrough_button == Some(button) {
+            runtime.passthrough_button = None;
+            return false;
+        }
+        record_macro_gesture_position(&mut runtime, x, y, Instant::now());
+        let Some(capture) = runtime.macro_gesture.as_ref() else {
+            return false;
+        };
+        if capture.button != button {
+            return true;
+        }
+        let mut capture = runtime.macro_gesture.take().expect("gesture was checked");
+        let is_drag = capture.max_distance_squared >= MACRO_DRAG_THRESHOLD_SQUARED;
+        let mut points = if is_drag {
+            if (capture.furthest_point.x, capture.furthest_point.y)
+                != (capture.start_x, capture.start_y)
+                && !capture.points.iter().any(|point| {
+                    (point.x, point.y) == (capture.furthest_point.x, capture.furthest_point.y)
+                })
+            {
+                capture.points.push(capture.furthest_point);
+            }
+            capture.points.sort_by_key(|point| point.elapsed_ms);
+            let elapsed_ms = capture.started_at.elapsed().as_millis() as u64;
+            if capture
+                .points
+                .last()
+                .is_none_or(|point| (point.x, point.y) != (x, y))
+            {
+                capture.points.push(MacroGesturePoint { x, y, elapsed_ms });
+            }
+            capture
+                .points
+                .dedup_by(|next, previous| (next.x, next.y) == (previous.x, previous.y));
+            capture.points
+        } else {
+            Vec::new()
+        };
+        // Keep the payload bounded even if an unusually long drag produced many hook events.
+        points.truncate(MAX_MACRO_DRAG_POINTS + 2);
+        let payload = MacroGesturePickedPayload {
+            kind: if is_drag { "drag" } else { "click" },
+            button: button.name(),
+            start_x: capture.start_x,
+            start_y: capture.start_y,
+            end_x: x,
+            end_y: y,
+            points,
+        };
+        (runtime.app.clone(), payload)
+    };
+
+    if let Some(app) = app {
+        let _ = app.emit("macro-gesture-picked", payload);
+    }
+    true
+}
+
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if code < 0 {
         return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
@@ -339,20 +533,36 @@ unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPA
         runtime.purpose
     };
 
+    if purpose == PickerPurpose::MacroCoordinate {
+        let button_down = match message {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => Some(MacroMouseButton::Left),
+            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => Some(MacroMouseButton::Right),
+            _ => None,
+        };
+        if let Some(button) = button_down {
+            if begin_macro_gesture(button, mouse.pt.x, mouse.pt.y) {
+                return 1;
+            }
+            return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+        }
+
+        let button_up = match message {
+            WM_LBUTTONUP => Some(MacroMouseButton::Left),
+            WM_RBUTTONUP => Some(MacroMouseButton::Right),
+            _ => None,
+        };
+        if let Some(button) = button_up {
+            if finish_macro_gesture(button, mouse.pt.x, mouse.pt.y) {
+                return 1;
+            }
+        }
+        return CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam);
+    }
+
     let shift_down = (GetAsyncKeyState(VK_SHIFT as i32) & 0x8000u16 as i16) != 0;
     let ctrl_down = (GetAsyncKeyState(VK_CONTROL as i32) & 0x8000u16 as i16) != 0;
 
-    let decision = if purpose == PickerPurpose::MacroCoordinate {
-        match message {
-            WM_RBUTTONDOWN | WM_RBUTTONDBLCLK => MouseHookDecision::Pick {
-                continue_picking: true,
-            },
-            WM_RBUTTONUP => MouseHookDecision::Swallow,
-            _ => MouseHookDecision::Pass,
-        }
-    } else {
-        classify_mouse_message(message, shift_down, ctrl_down)
-    };
+    let decision = classify_mouse_message(message, shift_down, ctrl_down);
 
     match decision {
         MouseHookDecision::Pass => CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam),
@@ -412,6 +622,7 @@ fn emit_cursor_position(x: i32, y: i32) {
         }
 
         let now = Instant::now();
+        record_macro_gesture_position(&mut runtime, x, y, now);
         if runtime
             .last_cursor_emit
             .is_some_and(|last| now.duration_since(last) < CURSOR_EMIT_INTERVAL)
@@ -441,21 +652,17 @@ fn emit_cursor_position(x: i32, y: i32) {
 }
 
 fn emit_pick(x: i32, y: i32, continue_picking: bool) {
-    let (app, purpose) = {
+    let app = {
         let runtime = picker().lock().unwrap_or_else(poisoned_inner);
         if !runtime.active {
             return;
         }
-        (runtime.app.clone(), runtime.purpose)
+        runtime.app.clone()
     };
 
     if let Some(app) = app {
-        let event_name = match purpose {
-            PickerPurpose::ClickPoints => "click-point-picked",
-            PickerPurpose::MacroCoordinate => "macro-coordinate-picked",
-        };
         let _ = app.emit(
-            event_name,
+            "click-point-picked",
             ClickPointPickedPayload {
                 x,
                 y,
