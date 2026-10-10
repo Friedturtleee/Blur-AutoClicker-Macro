@@ -132,6 +132,7 @@
 .macro-panel input,
 .macro-panel textarea,
 .macro-panel select {
+  box-sizing: border-box;
   color: var(--text-primary);
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
@@ -176,7 +177,8 @@
 
 .macro-button:focus-visible,
 .macro-panel .adv-dropdown-trigger:focus-visible,
-.macro-panel input:focus-visible {
+.macro-panel input:focus-visible,
+.macro-panel .settings-keybind-capture:focus-visible {
   outline: 2px solid var(--accent-ring);
   outline-offset: 1px;
 }
@@ -725,6 +727,38 @@
   font-family: var(--font-family-base);
 }
 
+.macro-panel .settings-keybind-capture {
+  box-sizing: border-box;
+  height: var(--adv-control-height);
+  min-height: var(--adv-control-height);
+  padding: 0 0.45rem;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius-sm);
+  background: var(--bg-elevated);
+  color: var(--text-primary);
+  font-family: var(--font-family-base);
+  font-size: 0.875rem;
+  font-weight: var(--font-weight-md);
+  line-height: 1.2;
+  text-align: center;
+}
+
+.macro-panel .settings-keybind-capture:hover:not(:disabled) {
+  border-color: var(--accent-ring);
+}
+
+.macro-panel .hk-idle-empty .settings-keybind-capture {
+  color: var(--text-dim);
+}
+
+.macro-panel .hk-listening .settings-keybind-capture {
+  color: var(--accent-strong);
+}
+
+.macro-panel .hk-conflict .settings-keybind-capture {
+  color: var(--accent-red);
+}
+
 .macro-run-hotkey {
   display: grid;
   grid-template-columns: minmax(6.5rem, auto) minmax(9rem, 1fr) minmax(
@@ -748,8 +782,11 @@
 }
 
 .macro-run-hotkey-manual {
+  box-sizing: border-box;
   width: 100%;
+  height: var(--adv-control-height);
   min-width: 0;
+  font-size: 0.875rem;
 }
 
 .macro-run-hotkey-capture {
