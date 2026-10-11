@@ -1,8 +1,8 @@
 use super::ClickerConfig;
 use std::collections::HashMap;
 use std::io::Cursor;
-use std::sync::Mutex;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use crate::error::poisoned_inner;
 use windows_sys::Win32::Foundation::{CloseHandle, HWND, INVALID_HANDLE_VALUE, LPARAM};
@@ -28,6 +28,22 @@ const DI_NORMAL: u32 = 0x0003;
 const PROCESS_DISPLAY_TITLE_MAX_CHARS: usize = 35;
 const PROCESS_ICON_CACHE_MAX_ENTRIES: usize = 128;
 const PROCESS_ICON_MAX_DIMENSION: u32 = 256;
+// Foreground HWND/PID are checked each pass; only executable-path lookup is throttled.
+const FOREGROUND_PROCESS_CACHE_TTL: Duration = Duration::from_millis(250);
+
+#[derive(Clone)]
+struct CachedForegroundProcess {
+    hwnd: HWND,
+    pid: u32,
+    resolved_at: Instant,
+    name: String,
+}
+
+thread_local! {
+    static FOREGROUND_PROCESS_CACHE: std::cell::RefCell<Option<CachedForegroundProcess>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
 
 extern "system" {
     fn QueryFullProcessImageNameW(
@@ -306,6 +322,20 @@ pub fn get_foreground_process_name() -> Option<String> {
     if pid == 0 {
         return None;
     }
+    if let Some(name) = FOREGROUND_PROCESS_CACHE.with(|cache| {
+        cache
+            .borrow()
+            .as_ref()
+            .filter(|cached| {
+                cached.hwnd == hwnd
+                    && cached.pid == pid
+                    && cached.resolved_at.elapsed() < FOREGROUND_PROCESS_CACHE_TTL
+            })
+            .map(|cached| cached.name.clone())
+    }) {
+        return Some(name);
+    }
+
     // Querying the executable path for one known PID avoids taking and scanning a
     // full process snapshot on every foreground safety check. Some protected
     // processes reject this query, so retain the snapshot lookup as a fallback.
@@ -317,6 +347,14 @@ pub fn get_foreground_process_name() -> Option<String> {
                 .map(str::to_owned)
         })
         .or_else(|| get_process_name_from_pid(pid))?;
+    FOREGROUND_PROCESS_CACHE.with(|cache| {
+        *cache.borrow_mut() = Some(CachedForegroundProcess {
+            hwnd,
+            pid,
+            resolved_at: Instant::now(),
+            name: process_name.clone(),
+        });
+    });
     Some(process_name)
 }
 
@@ -372,7 +410,13 @@ pub fn list_running_processes() -> Vec<ProcessInfo> {
             })
         })
         .collect();
-    result.sort_by_cached_key(|process| process.display_name.to_lowercase());
+    result.sort_by_cached_key(|process| {
+        (
+            process.display_name.to_lowercase(),
+            process.name.clone(),
+            process.pid,
+        )
+    });
     result
 }
 

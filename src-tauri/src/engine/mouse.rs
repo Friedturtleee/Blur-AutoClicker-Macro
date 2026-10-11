@@ -1,7 +1,6 @@
 use super::cycle::{execute_click_cycle, ClickCycleKind, ClickCyclePlan};
 use super::worker::{sleep_interruptible, RunControl};
-use std::time::Duration;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use super::AUTOCLICKER_EXTRA_INFO;
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -153,6 +152,28 @@ pub fn current_monitor_rects() -> Option<Vec<VirtualScreenRect>> {
 #[cfg(not(target_os = "windows"))]
 pub fn current_monitor_rects() -> Option<Vec<VirtualScreenRect>> {
     current_virtual_screen_rect().map(|screen| vec![screen])
+}
+
+#[derive(Default)]
+pub struct MonitorRectCache {
+    monitors: Vec<VirtualScreenRect>,
+    refreshed_at: Option<Instant>,
+}
+
+impl MonitorRectCache {
+    pub fn monitors(&mut self) -> &[VirtualScreenRect] {
+        // Keep display changes fresh while avoiding monitor enumeration on every input.
+        const REFRESH_INTERVAL: Duration = Duration::from_millis(250);
+        if self
+            .refreshed_at
+            .as_ref()
+            .is_none_or(|refreshed_at| refreshed_at.elapsed() >= REFRESH_INTERVAL)
+        {
+            self.monitors = current_monitor_rects().unwrap_or_default();
+            self.refreshed_at = Some(Instant::now());
+        }
+        &self.monitors
+    }
 }
 
 #[inline]

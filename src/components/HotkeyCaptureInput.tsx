@@ -14,12 +14,16 @@ import {
   captureModifierHotkey,
   defaultHotkeyLabels,
   formatHotkeyForDisplay,
-  getKeyboardLayoutMap,
   getMainKey,
   getStateClass,
   MAX_CHORD_MAINS,
+  mouseTokenFromButton,
   sortHeld,
 } from "../hotkeys";
+import {
+  useHotkeyCaptureSession,
+  useKeyboardLayoutMap,
+} from "./hotkeyCaptureHooks";
 
 interface Props {
   value: string;
@@ -35,6 +39,8 @@ interface Props {
 export interface HotkeyCaptureInputHandle {
   startListening: () => void;
 }
+
+const CHORD_WINDOW_MS = 600;
 
 const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
   function HotkeyCaptureInput(
@@ -55,8 +61,7 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
     const ignorePrimaryInputMouseUntilRef = useRef(0);
     const suppressedMouseButtonsRef = useRef<Set<number>>(new Set());
     const suppressResetTimerRef = useRef<number | null>(null);
-    const [layoutMap, setLayoutMap] =
-      useState<Awaited<ReturnType<typeof getKeyboardLayoutMap>>>(null);
+    const layoutMap = useKeyboardLayoutMap();
     const onChangeRef = useRef(onChange);
 
     useImperativeHandle(ref, () => ({
@@ -80,12 +85,6 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
     });
 
     useEffect(() => {
-      let active = true;
-
-      getKeyboardLayoutMap().then((map) => {
-        if (active) setLayoutMap(map);
-      });
-
       const handleSuppressedMouseEvent = (event: MouseEvent) => {
         if (!suppressedMouseButtonsRef.current.has(event.button)) return;
 
@@ -101,7 +100,6 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
       window.addEventListener("contextmenu", handleSuppressedMouseEvent, true);
 
       return () => {
-        active = false;
         if (suppressResetTimerRef.current !== null) {
           window.clearTimeout(suppressResetTimerRef.current);
         }
@@ -120,29 +118,7 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
       };
     }, []);
 
-    useEffect(() => {
-      if (!listening) return;
-
-      invoke("set_hotkey_capture_active", { active: true }).catch((err) => {
-        error(
-          JSON.stringify({
-            source: "HotkeyCaptureInput.toggle",
-            error: String(err),
-          }),
-        );
-      });
-
-      return () => {
-        invoke("set_hotkey_capture_active", { active: false }).catch((err) => {
-          error(
-            JSON.stringify({
-              source: "HotkeyCaptureInput.clear",
-              error: String(err),
-            }),
-          );
-        });
-      };
-    }, [listening]);
+    useHotkeyCaptureSession(listening, "HotkeyCaptureInput");
 
     useEffect(() => {
       if (!listening) return;
@@ -160,15 +136,6 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
       const heldMains = new Set<string>();
       let chordMaxSeen = new Set<string>();
       let chordTimer: number | null = null;
-      const CHORD_WINDOW_MS = 600;
-
-      const mouseButtonToToken: Record<number, string> = {
-        0: "mouseleft",
-        1: "mousemiddle",
-        2: "mouseright",
-        3: "mouse4",
-        4: "mouse5",
-      };
 
       const suppressButtons = (buttons: number[]) => {
         for (const b of buttons) suppressedMouseButtonsRef.current.add(b);
@@ -357,7 +324,7 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
           return;
         }
 
-        const token = mouseButtonToToken[event.button];
+        const token = mouseTokenFromButton(event.button);
         if (!token) return;
 
         if (event.cancelable) {
@@ -374,7 +341,7 @@ const HotkeyCaptureInput = forwardRef<HotkeyCaptureInputHandle, Props>(
           if (event.cancelable) event.preventDefault();
           event.stopPropagation();
         }
-        const token = mouseButtonToToken[event.button];
+        const token = mouseTokenFromButton(event.button);
         if (token && heldMains.has(token)) {
           heldMains.delete(token);
           if (chordTimer !== null && heldMains.size === 0) {

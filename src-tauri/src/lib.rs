@@ -15,6 +15,7 @@ mod hotkeys;
 mod icon;
 mod macro_engine;
 mod overlay;
+mod picker_hook_thread;
 mod target_window;
 mod ui_commands;
 mod updates;

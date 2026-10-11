@@ -45,7 +45,7 @@ export default class ErrorBoundary extends Component<Props, State> {
             height: "100dvh",
             padding: 24,
             textAlign: "center",
-            fontFamily: "system-ui, sans-serif",
+            fontFamily: "var(--font-family-base)",
             background: "var(--bg-base)",
             color: "var(--text-primary)",
           }}

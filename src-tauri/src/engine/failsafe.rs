@@ -1,4 +1,4 @@
-use super::mouse::{current_cursor_position, current_monitor_rects, VirtualScreenRect};
+use super::mouse::VirtualScreenRect;
 use super::{ClickerConfig, ZoneAction};
 
 pub fn detect_stop_zones(
@@ -94,6 +94,14 @@ pub fn detect_failsafe(
         }
     }
 
+    detect_screen_failsafe(cursor, monitors, config)
+}
+
+pub fn detect_screen_failsafe(
+    cursor: (i32, i32),
+    monitors: &[VirtualScreenRect],
+    config: &ClickerConfig,
+) -> Option<String> {
     if config.corner_stop_enabled {
         for monitor in monitors.iter().copied() {
             if let Some(reason) = detect_corner_failsafe(cursor, monitor, config) {
@@ -111,12 +119,6 @@ pub fn detect_failsafe(
     }
 
     None
-}
-
-pub fn should_stop_for_failsafe(config: &ClickerConfig) -> Option<String> {
-    let cursor = current_cursor_position()?;
-    let monitors = current_monitor_rects()?;
-    detect_failsafe(cursor, &monitors, config)
 }
 
 #[cfg(test)]

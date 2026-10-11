@@ -1,8 +1,5 @@
 .adv-panel {
   --adv-control-height: 32px;
-}
-
-.adv-panel {
   display: flex;
   flex-direction: column;
   height: 100%;
@@ -46,7 +43,7 @@
 }
 
 .adv-card-title {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.875rem;
   font-weight: var(--font-weight-hv);
   color: var(--text-primary);
@@ -65,7 +62,7 @@
 }
 
 .adv-card-desc {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.75rem;
   color: var(--text-dim);
   line-height: 1.4;
@@ -98,15 +95,8 @@ input[type="number"]::-webkit-outer-spin-button {
   border-color: var(--accent-ring);
 }
 
-.adv-number-sm {
-  font-family: "RobotoFlex", sans-serif;
-  font-size: 0.875rem;
-  font-weight: var(--font-weight-hv);
-  color: var(--text-primary);
-}
-
 .adv-unit {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.625rem;
   font-weight: var(--font-weight-hv);
   letter-spacing: 0.05em;
@@ -120,7 +110,7 @@ input[type="number"]::-webkit-outer-spin-button {
   justify-content: center;
   height: 30px;
   box-sizing: border-box;
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 12px;
   font-weight: var(--font-weight-hv);
   padding: 0 8px;
@@ -164,7 +154,7 @@ input[type="number"]::-webkit-outer-spin-button {
 .adv-seg-btn {
   flex: 0 0 auto;
   height: calc(var(--adv-control-height) - 2px);
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 1rem;
   font-weight: var(--font-weight-md);
   line-height: 1.125rem;
@@ -208,7 +198,7 @@ input[type="number"]::-webkit-outer-spin-button {
 }
 
 .adv-toggle-btn {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.75rem;
   font-weight: 800;
   letter-spacing: 4%;
@@ -291,14 +281,14 @@ input[type="number"]::-webkit-outer-spin-button {
 }
 
 .adv-click-points-empty-title {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.8125rem;
   font-weight: var(--font-weight-hv);
   color: var(--text-muted);
 }
 
 .adv-click-points-empty-hint {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.6875rem;
   font-weight: var(--font-weight-li);
   color: var(--text-dim);
@@ -344,7 +334,7 @@ input[type="number"]::-webkit-outer-spin-button {
 }
 
 .adv-disabled-label {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.6875rem;
   font-weight: 700;
   text-transform: uppercase;
@@ -358,7 +348,7 @@ input[type="number"]::-webkit-outer-spin-button {
 }
 
 .adv-number-sm {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.75rem;
   font-weight: var(--font-weight-hv);
   color: var(--text-dim);
@@ -397,7 +387,7 @@ input[type="number"]::-webkit-outer-spin-button {
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.6875rem;
   font-weight: var(--font-weight-li);
   color: var(--text-muted);
@@ -454,7 +444,7 @@ input[type="number"]::-webkit-outer-spin-button {
   background: transparent;
   border: none;
   color: var(--text-primary);
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 1rem;
   font-weight: var(--font-weight-md);
   cursor: pointer;
@@ -473,7 +463,7 @@ input[type="number"]::-webkit-outer-spin-button {
   background: transparent;
   border: none;
   color: var(--text-dim);
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 1rem;
   font-weight: var(--font-weight-md);
   cursor: pointer;
@@ -511,7 +501,7 @@ input[type="number"]::-webkit-outer-spin-button {
   min-height: var(--adv-control-height);
   padding: 0 0.75rem;
   color: var(--text-dim);
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 1rem;
   font-weight: var(--font-weight-hv);
   cursor: pointer;

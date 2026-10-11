@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import "./StatusBar.css";
+import { formatStopReason } from "../stopReason";
 
 interface Props {
   activePresetName: string | null;
@@ -16,42 +17,6 @@ interface Props {
   timeLimitMs: number;
   onGoToPresets: () => void;
   onGoToVersionInfo: () => void;
-}
-
-const STOP_REASON_TEXTS: Record<string, string> = {
-  "Stopped from UI": "Stopped from UI",
-  "Stopped from toggle": "Stopped from toggle",
-  "Stopped from hotkey": "Stopped from hotkey",
-  "Stopped from hold hotkey": "Stopped from hold hotkey",
-  Stopped: "Stopped",
-  "Top-left corner failsafe": "Top-left corner failsafe",
-  "Top-right corner failsafe": "Top-right corner failsafe",
-  "Bottom-left corner failsafe": "Bottom-left corner failsafe",
-  "Bottom-right corner failsafe": "Bottom-right corner failsafe",
-  "Top edge failsafe": "Top edge failsafe",
-  "Right edge failsafe": "Right edge failsafe",
-  "Bottom edge failsafe": "Bottom edge failsafe",
-  "Left edge failsafe": "Left edge failsafe",
-  "Blocked by Alt+Tab": "Blocked by Alt+Tab",
-  "Blocked by process list": "Blocked by process list",
-};
-
-function translateStopReason(stopReason: string | null | undefined): string {
-  if (!stopReason) return "";
-  const staticText = STOP_REASON_TEXTS[stopReason];
-  if (staticText) return staticText;
-
-  const clickLimit = stopReason.match(/^Click limit reached \((.+)\)$/);
-  if (clickLimit) {
-    return `Click limit reached (${clickLimit[1]})`;
-  }
-
-  const timeLimit = stopReason.match(/^Time limit reached \((.+)\)$/);
-  if (timeLimit) {
-    return `Time limit reached (${timeLimit[1]})`;
-  }
-
-  return stopReason;
 }
 
 function formatElapsed(ms: number): string {
@@ -95,7 +60,7 @@ export default function StatusBar({
         );
       };
       tick();
-      intervalRef.current = setInterval(tick, 200);
+      intervalRef.current = setInterval(tick, 1000);
     } else if (running && paused) {
       if (segmentStartRef.current !== null) {
         baseElapsedRef.current += Date.now() - segmentStartRef.current;
@@ -153,12 +118,12 @@ export default function StatusBar({
     }
 
     if (paused && stopReason) {
-      parts.push(translateStopReason(stopReason));
+      parts.push(formatStopReason(stopReason));
     }
 
     centerText = parts.join("\u00A0\u00A0•\u00A0\u00A0");
   } else if (stopReason) {
-    const reason = translateStopReason(stopReason);
+    const reason = formatStopReason(stopReason);
     centerText = clickCount > 0 ? `${reason} • ${clickCount} clicks` : reason;
   }
 

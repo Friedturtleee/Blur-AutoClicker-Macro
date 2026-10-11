@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::SyncSender;
 use std::sync::{Arc, Mutex, OnceLock};
@@ -244,7 +245,7 @@ pub fn recorder_start(
     if let Err(error) = std::thread::Builder::new()
         .name("blur-recorder-events".into())
         .spawn(move || {
-            let mut events = Vec::new();
+            let mut events = Vec::with_capacity(MAX_RECORDED_EVENTS);
             let mut pending_ui_events = Vec::with_capacity(64);
             let mut last_ui_flush = Instant::now();
             let mut event_limit_warning_active = false;
@@ -256,13 +257,10 @@ pub fn recorder_start(
                     Ok(message) => message,
                     Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                         if !pending_ui_events.is_empty() {
-                            let batch = std::mem::take(&mut pending_ui_events);
-                            let _ = worker_control.app.emit(
-                                "recorder:events",
-                                serde_json::json!({
-                                    "sessionId": worker_control.id,
-                                    "events": batch,
-                                }),
+                            emit_recorder_event_batch(
+                                &worker_control.app,
+                                &worker_control.id,
+                                &mut pending_ui_events,
                             );
                             last_ui_flush = Instant::now();
                         }
@@ -305,25 +303,20 @@ pub fn recorder_start(
                     if pending_ui_events.len() >= 64
                         || last_ui_flush.elapsed() >= std::time::Duration::from_millis(50)
                     {
-                        let batch = std::mem::take(&mut pending_ui_events);
-                        let _ = worker_control.app.emit(
-                            "recorder:events",
-                            serde_json::json!({
-                                "sessionId": worker_control.id,
-                                "events": batch,
-                            }),
+                        emit_recorder_event_batch(
+                            &worker_control.app,
+                            &worker_control.id,
+                            &mut pending_ui_events,
                         );
                         last_ui_flush = Instant::now();
                     }
                 }
             }
             if !pending_ui_events.is_empty() {
-                let _ = worker_control.app.emit(
-                    "recorder:events",
-                    serde_json::json!({
-                        "sessionId": worker_control.id,
-                        "events": pending_ui_events,
-                    }),
+                emit_recorder_event_batch(
+                    &worker_control.app,
+                    &worker_control.id,
+                    &mut pending_ui_events,
                 );
             }
             let source = events_to_script(&events, &worker_control.excluded_hotkeys);
@@ -333,8 +326,8 @@ pub fn recorder_start(
                 serde_json::json!({
                     "sessionId": worker_control.id,
                     "eventCount": event_count,
-                    "source": source.clone(),
-                    "events": events.clone(),
+                    "source": &source,
+                    "events": &events,
                 }),
             );
             worker_control.active.store(false, Ordering::SeqCst);
@@ -656,6 +649,21 @@ fn enqueue_recorded_event(route: &HookRoute, event: RecordedEvent) {
     }
 }
 
+fn emit_recorder_event_batch(
+    app: &tauri::AppHandle,
+    session_id: &str,
+    events: &mut Vec<RecordedEvent>,
+) {
+    if events.is_empty() {
+        return;
+    }
+    let _ = app.emit(
+        "recorder:events",
+        serde_json::json!({"sessionId": session_id, "events": events.as_slice()}),
+    );
+    events.clear();
+}
+
 #[cfg(test)]
 fn route_for_session(route: Option<&Arc<HookRoute>>, session_id: &str) -> Option<Arc<HookRoute>> {
     route
@@ -674,17 +682,18 @@ fn hook_sender_for_callback() -> Option<Arc<HookRoute>> {
 }
 
 fn events_to_script(events: &[RecordedEvent], excluded_hotkeys: &[String]) -> String {
+    use std::fmt::Write as _;
+
     let filtered = filter_shortcut_events(events, excluded_hotkeys);
-    let mut lines = vec![
-        "mode foreground".to_string(),
-        "# Recorded locally. Review and validate before replay.".to_string(),
-    ];
+    let mut script = String::with_capacity(filtered.len().saturating_mul(64).saturating_add(64));
+    script.push_str("mode foreground\n# Recorded locally. Review and validate before replay.");
     let mut last_at = 0u64;
     let mut cursor_position = None;
-    for event in &filtered {
+    for event in filtered.iter() {
         let delay = event.at_ms.saturating_sub(last_at);
         if delay > 0 {
-            lines.push(format!("wait {delay}ms"));
+            script.push('\n');
+            let _ = write!(&mut script, "wait {delay}ms");
         }
         let event_position = match &event.kind {
             RecordedKind::Move { x, y } => Some((*x, *y)),
@@ -708,30 +717,42 @@ fn events_to_script(events: &[RecordedEvent], excluded_hotkeys: &[String]) -> St
                     RecordedKind::MouseDown { .. } | RecordedKind::MouseUp { .. }
                 )
             {
-                lines.push(format!("move x={x} y={y} space=screen"));
+                script.push('\n');
+                let _ = write!(&mut script, "move x={x} y={y} space=screen");
             }
             cursor_position = Some((x, y));
         }
-        let line = match &event.kind {
+        script.push('\n');
+        match &event.kind {
             RecordedKind::Move { x, y } => {
                 cursor_position = Some((*x, *y));
-                format!("move x={x} y={y} space=screen")
+                let _ = write!(&mut script, "move x={x} y={y} space=screen");
             }
-            RecordedKind::MouseDown { button, .. } => format!("mouse_down button={button}"),
-            RecordedKind::MouseUp { button, .. } => format!("mouse_up button={button}"),
+            RecordedKind::MouseDown { button, .. } => {
+                let _ = write!(&mut script, "mouse_down button={button}");
+            }
+            RecordedKind::MouseUp { button, .. } => {
+                let _ = write!(&mut script, "mouse_up button={button}");
+            }
             RecordedKind::Scroll { delta, x, y } => {
-                format!("scroll delta={delta} x={x} y={y} space=screen")
+                let _ = write!(&mut script, "scroll delta={delta} x={x} y={y} space=screen");
             }
-            RecordedKind::KeyDown { key } => format!("key_down {key:?}"),
-            RecordedKind::KeyUp { key } => format!("key_up {key:?}"),
-        };
-        lines.push(line);
+            RecordedKind::KeyDown { key } => {
+                let _ = write!(&mut script, "key_down {key:?}");
+            }
+            RecordedKind::KeyUp { key } => {
+                let _ = write!(&mut script, "key_up {key:?}");
+            }
+        }
         last_at = event.at_ms;
     }
-    lines.join("\n")
+    script
 }
 
-fn filter_shortcut_events(events: &[RecordedEvent], hotkeys: &[String]) -> Vec<RecordedEvent> {
+fn filter_shortcut_events<'a>(
+    events: &'a [RecordedEvent],
+    hotkeys: &[String],
+) -> Cow<'a, [RecordedEvent]> {
     use std::collections::{HashMap, HashSet};
 
     let shortcuts = hotkeys
@@ -746,7 +767,7 @@ fn filter_shortcut_events(events: &[RecordedEvent], hotkeys: &[String]) -> Vec<R
         .filter(|keys| !keys.is_empty())
         .collect::<Vec<_>>();
     if shortcuts.is_empty() {
-        return events.to_vec();
+        return Cow::Borrowed(events);
     }
 
     let all_shortcut_keys = shortcuts.iter().flatten().cloned().collect::<HashSet<_>>();
@@ -837,12 +858,14 @@ fn filter_shortcut_events(events: &[RecordedEvent], hotkeys: &[String]) -> Vec<R
         }
     }
 
-    events
-        .iter()
-        .zip(suppressed)
-        .filter(|&(_, is_suppressed)| !is_suppressed)
-        .map(|(event, _)| event.clone())
-        .collect()
+    Cow::Owned(
+        events
+            .iter()
+            .zip(suppressed)
+            .filter(|&(_, is_suppressed)| !is_suppressed)
+            .map(|(event, _)| event.clone())
+            .collect(),
+    )
 }
 
 fn canonical_hotkey_key(value: &str) -> String {

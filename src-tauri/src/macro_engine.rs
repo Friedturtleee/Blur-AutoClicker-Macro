@@ -1288,6 +1288,7 @@ struct Execution {
     selected_pid: Option<u32>,
     target: Option<crate::target_window::TargetWindow>,
     safety_config: crate::engine::ClickerConfig,
+    monitor_cache: std::cell::RefCell<crate::engine::mouse::MonitorRectCache>,
     mode: ExecutionMode,
     variables: std::collections::HashMap<String, Value>,
     held_buttons: std::collections::HashSet<MouseButton>,
@@ -1351,35 +1352,18 @@ impl Execution {
                 || self.safety_config.corner_stop_enabled
                 || self.safety_config.edge_stop_enabled;
             if check_failsafes {
-                let monitors = if self.safety_config.corner_stop_enabled
-                    || self.safety_config.edge_stop_enabled
-                {
-                    Some(match monitor_snapshot {
-                        Some(monitors) => std::borrow::Cow::Borrowed(monitors),
-                        None => std::borrow::Cow::Owned(
-                            crate::engine::mouse::current_monitor_rects().unwrap_or_default(),
-                        ),
-                    })
+                if self.safety_config.corner_stop_enabled || self.safety_config.edge_stop_enabled {
+                    if let Some(monitors) = monitor_snapshot {
+                        self.check_foreground_failsafes(proposed_position, monitors)?;
+                    } else {
+                        let mut monitor_cache = self.monitor_cache.borrow_mut();
+                        self.check_foreground_failsafes(
+                            proposed_position,
+                            monitor_cache.monitors(),
+                        )?;
+                    }
                 } else {
-                    None
-                };
-                if let Some(cursor) = crate::engine::mouse::current_cursor_position() {
-                    if let Some(reason) = crate::engine::failsafe::detect_failsafe(
-                        cursor,
-                        monitors.as_deref().unwrap_or(&[]),
-                        &self.safety_config,
-                    ) {
-                        return Err(reason);
-                    }
-                }
-                if let Some(position) = proposed_position {
-                    if let Some(reason) = crate::engine::failsafe::detect_failsafe(
-                        position,
-                        monitors.as_deref().unwrap_or(&[]),
-                        &self.safety_config,
-                    ) {
-                        return Err(reason);
-                    }
+                    self.check_foreground_failsafes(proposed_position, &[])?;
                 }
             }
         } else if self.safety_config.process_list_enabled {
@@ -1401,6 +1385,28 @@ impl Execution {
                 return Err(format!(
                     "Target process {target_name:?} is blocked by the configured process list."
                 ));
+            }
+        }
+        Ok(())
+    }
+
+    fn check_foreground_failsafes(
+        &self,
+        proposed_position: Option<(i32, i32)>,
+        monitors: &[crate::engine::mouse::VirtualScreenRect],
+    ) -> Result<(), String> {
+        if let Some(cursor) = crate::engine::mouse::current_cursor_position() {
+            if let Some(reason) =
+                crate::engine::failsafe::detect_failsafe(cursor, monitors, &self.safety_config)
+            {
+                return Err(reason);
+            }
+        }
+        if let Some(position) = proposed_position {
+            if let Some(reason) =
+                crate::engine::failsafe::detect_failsafe(position, monitors, &self.safety_config)
+            {
+                return Err(reason);
             }
         }
         Ok(())
@@ -1612,8 +1618,13 @@ impl Execution {
         self.wait_until_resumed()?;
         let (x, y) = self.screen_coordinates(x, y, space)?;
         let start = crate::engine::mouse::current_cursor_position().unwrap_or((x, y));
+        let monitors = self.monitor_cache.borrow_mut().monitors().to_vec();
+        if !monitors.is_empty() && !monitors.iter().any(|monitor| monitor.contains(x, y)) {
+            return Err("Foreground coordinates must lie on a connected monitor.".into());
+        }
         let steps = (duration_ms.saturating_add(7) / 8).clamp(1, 100);
         let mut elapsed_ms = 0u64;
+        let mut previous = start;
         for step in 1..=steps {
             self.check_limits()?;
             let target_elapsed_ms =
@@ -1625,12 +1636,11 @@ impl Execution {
                 .round() as i32;
             let next_y = (f64::from(start.1) + (f64::from(y) - f64::from(start.1)) * fraction)
                 .round() as i32;
-            let monitors = crate::engine::mouse::current_monitor_rects().unwrap_or_default();
-            if !monitors.is_empty() && !monitors.iter().any(|monitor| monitor.contains(x, y)) {
-                return Err("Foreground coordinates must lie on a connected monitor.".into());
-            }
             self.check_input_policy_with_monitors(Some((next_x, next_y)), Some(&monitors))?;
-            crate::engine::mouse::try_move_mouse(next_x, next_y)?;
+            if (next_x, next_y) != previous {
+                crate::engine::mouse::try_move_mouse(next_x, next_y)?;
+                previous = (next_x, next_y);
+            }
         }
         Ok(())
     }
@@ -1977,12 +1987,24 @@ impl Execution {
     }
 
     fn type_text(&mut self, text: &str) -> Result<(), String> {
-        if text.encode_utf16().count() > 10_000 {
+        let units: Vec<u16> = text.encode_utf16().collect();
+        if units.len() > 10_000 {
             return Err("type text is limited to 10000 UTF-16 code units per statement.".into());
         }
-        for unit in text.encode_utf16() {
+        // Bound SendInput calls so long strings do not send one call per code unit.
+        const TYPE_TEXT_BATCH_UNITS: usize = 32;
+        let mut start = 0;
+        while start < units.len() {
+            let mut end = (start + TYPE_TEXT_BATCH_UNITS).min(units.len());
+            if end < units.len()
+                && (0xD800..=0xDBFF).contains(&units[end - 1])
+                && (0xDC00..=0xDFFF).contains(&units[end])
+            {
+                end += 1;
+            }
             self.check_input_policy(None)?;
-            type_unicode_unit(unit)?;
+            type_unicode_units(&units[start..end])?;
+            start = end;
         }
         Ok(())
     }
@@ -2149,27 +2171,26 @@ fn key_code(key: &str) -> Result<u16, String> {
 }
 
 #[cfg(windows)]
-fn type_unicode_unit(unit: u16) -> Result<(), String> {
+fn type_unicode_units(units: &[u16]) -> Result<(), String> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
         SendInput, INPUT, INPUT_KEYBOARD, KEYBDINPUT, KEYEVENTF_KEYUP, KEYEVENTF_UNICODE,
     };
-    let mut inputs: [INPUT; 2] = unsafe { std::mem::zeroed() };
-    for (index, flags) in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP]
-        .into_iter()
-        .enumerate()
-    {
-        inputs[index] = INPUT {
-            r#type: INPUT_KEYBOARD,
-            Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
-                ki: KEYBDINPUT {
-                    wVk: 0,
-                    wScan: unit,
-                    dwFlags: flags,
-                    time: 0,
-                    dwExtraInfo: crate::engine::AUTOCLICKER_EXTRA_INFO,
+    let mut inputs = Vec::with_capacity(units.len() * 2);
+    for &unit in units {
+        for flags in [KEYEVENTF_UNICODE, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP] {
+            inputs.push(INPUT {
+                r#type: INPUT_KEYBOARD,
+                Anonymous: windows_sys::Win32::UI::Input::KeyboardAndMouse::INPUT_0 {
+                    ki: KEYBDINPUT {
+                        wVk: 0,
+                        wScan: unit,
+                        dwFlags: flags,
+                        time: 0,
+                        dwExtraInfo: crate::engine::AUTOCLICKER_EXTRA_INFO,
+                    },
                 },
-            },
-        };
+            });
+        }
     }
     let accepted = unsafe {
         SendInput(
@@ -2179,14 +2200,27 @@ fn type_unicode_unit(unit: u16) -> Result<(), String> {
         )
     };
     if accepted != inputs.len() as u32 {
+        // SendInput can stop between a Unicode key-down and its paired key-up.
+        // Release that final key before returning so a partial batch cannot leave
+        // the target application with a logically held character key.
+        if accepted % 2 == 1 {
+            let pending_key_up = &inputs[accepted as usize];
+            unsafe {
+                SendInput(1, pending_key_up, std::mem::size_of::<INPUT>() as i32);
+            }
+        }
         return Err("Windows did not accept all Unicode text input.".into());
     }
     Ok(())
 }
 
 #[cfg(not(windows))]
-fn type_unicode_unit(_unit: u16) -> Result<(), String> {
-    Err("Unicode input is only supported on Windows.".into())
+fn type_unicode_units(units: &[u16]) -> Result<(), String> {
+    if units.is_empty() {
+        Ok(())
+    } else {
+        Err("Unicode input is only supported on Windows.".into())
+    }
 }
 
 #[cfg(windows)]
@@ -2317,6 +2351,7 @@ pub fn start_macro_inner(
         selected_pid,
         target: None,
         safety_config,
+        monitor_cache: std::cell::RefCell::new(crate::engine::mouse::MonitorRectCache::default()),
         mode: ExecutionMode::Foreground,
         variables: std::collections::HashMap::new(),
         held_buttons: std::collections::HashSet::new(),

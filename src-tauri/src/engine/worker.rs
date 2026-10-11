@@ -19,12 +19,11 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::cycle::ClickCyclePlan;
-use super::failsafe::detect_stop_zones;
-use super::failsafe::should_stop_for_failsafe;
+use super::failsafe::{detect_screen_failsafe, detect_stop_zones};
 use super::keyboard::{is_alphabetic_vk, send_key_down, send_key_presses, send_key_up};
 use super::mouse::{
     current_cursor_position, get_button_flags, get_cursor_pos, move_mouse, send_clicks,
-    smooth_move, VirtualScreenRect,
+    smooth_move, MonitorRectCache, VirtualScreenRect,
 };
 use super::process;
 use super::rng::SmallRng;
@@ -720,20 +719,76 @@ impl LoopState {
     }
 }
 
-fn check_abort(config: &ClickerConfig, start_time: Instant) -> Option<String> {
-    if let Some(reason) = should_stop_for_failsafe(config) {
-        return Some(reason);
+struct RuntimeSafetyCheck {
+    zone_hit: Option<(crate::engine::ZoneAction, usize)>,
+    // Global abort conditions; stop zones are handled at cycle boundaries.
+    stop_reason: Option<String>,
+}
+
+impl RuntimeSafetyCheck {
+    fn terminal_stop_reason(&self) -> Option<&str> {
+        if matches!(self.zone_hit, Some((crate::engine::ZoneAction::Stop, _))) {
+            Some("Custom stop zone failsafe")
+        } else {
+            self.stop_reason.as_deref()
+        }
     }
+}
+
+fn check_abort(
+    config: &ClickerConfig,
+    start_time: Instant,
+    monitor_cache: &mut MonitorRectCache,
+    include_zone_actions: bool,
+) -> RuntimeSafetyCheck {
+    let needs_cursor =
+        (include_zone_actions && config.stop_zones_enabled && !config.stop_zones.is_empty())
+            || config.corner_stop_enabled
+            || config.edge_stop_enabled;
+    let cursor = if needs_cursor {
+        current_cursor_position()
+    } else {
+        None
+    };
+    let zone_hit = if include_zone_actions && config.stop_zones_enabled {
+        cursor.and_then(|position| detect_stop_zones(position, config))
+    } else {
+        None
+    };
+
+    if config.corner_stop_enabled || config.edge_stop_enabled {
+        if let Some(cursor) = cursor {
+            if let Some(reason) = detect_screen_failsafe(cursor, monitor_cache.monitors(), config) {
+                return RuntimeSafetyCheck {
+                    zone_hit,
+                    stop_reason: Some(reason),
+                };
+            }
+        }
+    }
+
     if config.task_switcher_stop_enabled && process::is_task_switcher_active() {
-        return Some(String::from("Blocked by Alt+Tab"));
+        return RuntimeSafetyCheck {
+            zone_hit,
+            stop_reason: Some(String::from("Blocked by Alt+Tab")),
+        };
     }
     if config.process_list_enabled && process::check_process_list(config).is_some() {
-        return Some(String::from("Blocked by process list"));
+        return RuntimeSafetyCheck {
+            zone_hit,
+            stop_reason: Some(String::from("Blocked by process list")),
+        };
     }
     if config.time_limit > 0.0 && start_time.elapsed().as_secs_f64() >= config.time_limit {
-        return Some(format!("Time limit reached ({:.1}s)", config.time_limit));
+        return RuntimeSafetyCheck {
+            zone_hit,
+            stop_reason: Some(format!("Time limit reached ({:.1}s)", config.time_limit)),
+        };
     }
-    None
+    RuntimeSafetyCheck {
+        zone_hit,
+        stop_reason: None,
+    }
 }
 
 fn update_target(
@@ -920,6 +975,21 @@ fn cpu_usage(start_cycles: u64, cycle_freq: f64, elapsed_secs: f64) -> f64 {
     }
 }
 
+fn finish_run(
+    state: LoopState,
+    start_time: Instant,
+    cpu_start: u64,
+    cycle_freq: f64,
+) -> RunOutcome {
+    let elapsed_secs = start_time.elapsed().as_secs_f64();
+    RunOutcome {
+        stop_reason: state.stop_reason,
+        click_count: state.click_count,
+        elapsed_secs,
+        avg_cpu: cpu_usage(cpu_start, cycle_freq, elapsed_secs),
+    }
+}
+
 pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
     CLICK_COUNT.store(0, Ordering::SeqCst);
     let _timer = TimerResolutionGuard::new();
@@ -942,7 +1012,12 @@ pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
         emit_status(&control.app);
     }
 
-    let should_abort = || check_abort(&config, start_time).is_some();
+    let monitor_cache = std::cell::RefCell::new(MonitorRectCache::default());
+    let should_abort = || {
+        check_abort(&config, start_time, &mut monitor_cache.borrow_mut(), true)
+            .terminal_stop_reason()
+            .is_some()
+    };
     let clicker_state = control.app.state::<ClickerState>();
 
     // Keyboard hold mode: emulate Windows auto-repeat
@@ -955,16 +1030,15 @@ pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
         // Wait for initial repeat delay
         let delay_dur = Duration::from_millis(ctx.keyboard_repeat_delay_ms as u64);
         sleep_interruptible(delay_dur, &control, &should_abort);
-        if !control.is_active() || should_abort() {
+        if !control.is_active() {
             send_key_up(ctx.key_code, ctx.keyboard_uppercase);
-            let elapsed = start_time.elapsed().as_secs_f64();
-            let avg_cpu = cpu_usage(cpu_start, cycle_freq, elapsed);
-            return RunOutcome {
-                stop_reason: st.stop_reason,
-                click_count: st.click_count,
-                elapsed_secs: elapsed,
-                avg_cpu,
-            };
+            return finish_run(st, start_time, cpu_start, cycle_freq);
+        }
+        let safety = check_abort(&config, start_time, &mut monitor_cache.borrow_mut(), true);
+        if let Some(reason) = safety.terminal_stop_reason() {
+            st.stop_reason = reason.to_owned();
+            send_key_up(ctx.key_code, ctx.keyboard_uppercase);
+            return finish_run(st, start_time, cpu_start, cycle_freq);
         }
 
         // Auto-repeat loop: send repeated KEYDOWN at repeat interval
@@ -975,33 +1049,12 @@ pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
                 break;
             }
 
-            let zone_hit = if config.stop_zones_enabled && !config.stop_zones.is_empty() {
-                current_cursor_position().and_then(|cursor| detect_stop_zones(cursor, &config))
-            } else {
-                None
-            };
-
-            if let Some((crate::engine::ZoneAction::Stop, _)) = zone_hit {
-                st.stop_reason = String::from("Custom stop zone failsafe");
+            let safety = check_abort(&config, start_time, &mut monitor_cache.borrow_mut(), true);
+            if let Some(reason) = safety.terminal_stop_reason() {
+                st.stop_reason = reason.to_owned();
                 break;
             }
-
-            if let Some(reason) = should_stop_for_failsafe(&config) {
-                st.stop_reason = reason;
-                break;
-            }
-            if config.task_switcher_stop_enabled && process::is_task_switcher_active() {
-                st.stop_reason = String::from("Blocked by Alt+Tab");
-                break;
-            }
-            if config.process_list_enabled && process::check_process_list(&config).is_some() {
-                st.stop_reason = String::from("Blocked by process list");
-                break;
-            }
-            if config.time_limit > 0.0 && start_time.elapsed().as_secs_f64() >= config.time_limit {
-                st.stop_reason = format!("Time limit reached ({:.1}s)", config.time_limit);
-                break;
-            }
+            let zone_hit = safety.zone_hit;
 
             match zone_hit {
                 Some((crate::engine::ZoneAction::Pause, _)) => {
@@ -1034,15 +1087,7 @@ pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
 
         // Release key on exit
         send_key_up(ctx.key_code, ctx.keyboard_uppercase);
-
-        let elapsed = start_time.elapsed().as_secs_f64();
-        let avg_cpu = cpu_usage(cpu_start, cycle_freq, elapsed);
-        return RunOutcome {
-            stop_reason: st.stop_reason,
-            click_count: st.click_count,
-            elapsed_secs: elapsed,
-            avg_cpu,
-        };
+        return finish_run(st, start_time, cpu_start, cycle_freq);
     }
 
     // Normal mode (mouse or keyboard with <100% duty)
@@ -1052,33 +1097,12 @@ pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
             break;
         }
 
-        let zone_hit = if config.stop_zones_enabled && !config.stop_zones.is_empty() {
-            current_cursor_position().and_then(|cursor| detect_stop_zones(cursor, &config))
-        } else {
-            None
-        };
-
-        if let Some((crate::engine::ZoneAction::Stop, _)) = zone_hit {
-            st.stop_reason = String::from("Custom stop zone failsafe");
+        let safety = check_abort(&config, start_time, &mut monitor_cache.borrow_mut(), true);
+        if let Some(reason) = safety.terminal_stop_reason() {
+            st.stop_reason = reason.to_owned();
             break;
         }
-
-        if let Some(reason) = should_stop_for_failsafe(&config) {
-            st.stop_reason = reason;
-            break;
-        }
-        if config.task_switcher_stop_enabled && process::is_task_switcher_active() {
-            st.stop_reason = String::from("Blocked by Alt+Tab");
-            break;
-        }
-        if config.process_list_enabled && process::check_process_list(&config).is_some() {
-            st.stop_reason = String::from("Blocked by process list");
-            break;
-        }
-        if config.time_limit > 0.0 && start_time.elapsed().as_secs_f64() >= config.time_limit {
-            st.stop_reason = format!("Time limit reached ({:.1}s)", config.time_limit);
-            break;
-        }
+        let zone_hit = safety.zone_hit;
 
         match zone_hit {
             Some((crate::engine::ZoneAction::Pause, _)) => {
@@ -1106,15 +1130,7 @@ pub fn start_clicker(config: ClickerConfig, control: RunControl) -> RunOutcome {
         }
     }
 
-    let elapsed = start_time.elapsed().as_secs_f64();
-    let avg_cpu = cpu_usage(cpu_start, cycle_freq, elapsed);
-
-    RunOutcome {
-        stop_reason: st.stop_reason,
-        click_count: st.click_count,
-        elapsed_secs: elapsed,
-        avg_cpu,
-    }
+    finish_run(st, start_time, cpu_start, cycle_freq)
 }
 
 pub fn get_click_count() -> i64 {

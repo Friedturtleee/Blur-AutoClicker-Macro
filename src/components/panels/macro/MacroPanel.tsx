@@ -2,7 +2,15 @@ import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { readTextFile, writeTextFile } from "@tauri-apps/plugin-fs";
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
+import { hotkeyIdentity } from "../../../hotkeys";
 import ConfirmDialog from "../../ConfirmDialog";
 import HotkeyCaptureInput from "../../HotkeyCaptureInput";
 import {
@@ -24,6 +32,13 @@ import "./MacroPanel.css";
 
 type View = "editor" | "record" | "history";
 const TIMELINE_PAGE_SIZE = 200;
+const MAX_MACRO_LOG_ENTRIES = 100;
+
+function clearTimeoutRef(timerRef: { current: number | null }) {
+  if (timerRef.current !== null) window.clearTimeout(timerRef.current);
+  timerRef.current = null;
+}
+
 type RuntimeState =
   | "Idle"
   | "Recording"
@@ -48,6 +63,13 @@ interface Props {
     targetHwnd: number | null,
     targetPid: number | null,
   ) => Promise<void>;
+}
+
+interface RecordingResult {
+  sessionId: string;
+  source: string;
+  eventCount: number;
+  events: RecorderEvent[];
 }
 
 function makeId() {
@@ -83,46 +105,6 @@ function targetOptionValue(target: Pick<MacroTarget, "hwnd" | "pid">) {
   return `${target.hwnd}:${target.pid}`;
 }
 
-const HOTKEY_TOKEN_ALIASES: Record<string, string> = {
-  control: "ctrl",
-  option: "alt",
-  command: "super",
-  cmd: "super",
-  meta: "super",
-  win: "super",
-  lctrl: "leftctrl",
-  ctrlleft: "leftctrl",
-  rctrl: "rightctrl",
-  ctrlright: "rightctrl",
-  lalt: "leftalt",
-  altleft: "leftalt",
-  ralt: "rightalt",
-  altright: "rightalt",
-  altgr: "rightalt",
-  lshift: "leftshift",
-  shiftleft: "leftshift",
-  rshift: "rightshift",
-  shiftright: "rightshift",
-  lwin: "leftsuper",
-  leftwin: "leftsuper",
-  superleft: "leftsuper",
-  rwin: "rightsuper",
-  rightwin: "rightsuper",
-  superright: "rightsuper",
-};
-
-function hotkeyIdentity(value: string) {
-  return value
-    .split("+")
-    .map((token) => {
-      const normalized = token.trim().toLowerCase();
-      return HOTKEY_TOKEN_ALIASES[normalized] ?? normalized;
-    })
-    .filter(Boolean)
-    .sort()
-    .join("+");
-}
-
 function targetWindowSignature(targets: MacroTarget[]) {
   return targets
     .map((target) =>
@@ -150,16 +132,23 @@ function removeDirective(source: string, kind: "target" | "mode") {
     .join("\n");
 }
 
+function withUpdatedProfile(
+  settings: Settings,
+  profile: MacroProfile,
+  patch: Partial<MacroProfile>,
+) {
+  return settings.macroProfiles.map((item) =>
+    item.id === profile.id ? { ...item, ...patch } : item,
+  );
+}
+
 function updateProfile(
   settings: Settings,
   update: Props["update"],
   profile: MacroProfile,
   patch: Partial<MacroProfile>,
 ) {
-  const profiles = settings.macroProfiles.map((item) =>
-    item.id === profile.id ? { ...item, ...patch } : item,
-  );
-  update({ macroProfiles: profiles });
+  update({ macroProfiles: withUpdatedProfile(settings, profile, patch) });
 }
 
 function describeEvent(event: RecorderEvent) {
@@ -217,15 +206,45 @@ export default function MacroPanel({
   const [validation, setValidation] = useState<MacroValidation | null>(null);
   const [validatedSource, setValidatedSource] = useState<string | null>(null);
   const [validating, setValidating] = useState(false);
+  const [startingMacro, setStartingMacro] = useState(false);
+  const validationCacheRef = useRef(new Map<string, MacroValidation>());
+  const validationRequestsRef = useRef(
+    new Map<string, Promise<MacroValidation>>(),
+  );
+  const validateSource = useCallback((source: string) => {
+    const cached = validationCacheRef.current.get(source);
+    if (cached) return Promise.resolve(cached);
+
+    const pending = validationRequestsRef.current.get(source);
+    if (pending) return pending;
+
+    const request = invoke<MacroValidation>("macro_validate", { source })
+      .then((result) => {
+        validationCacheRef.current.set(source, result);
+        if (validationCacheRef.current.size > 8) {
+          const oldestSource = validationCacheRef.current.keys().next().value;
+          if (oldestSource !== undefined) {
+            validationCacheRef.current.delete(oldestSource);
+          }
+        }
+        return result;
+      })
+      .finally(() => validationRequestsRef.current.delete(source));
+    validationRequestsRef.current.set(source, request);
+    return request;
+  }, []);
   const [runtimeState, setRuntimeState] = useState<RuntimeState>("Idle");
   const [activeStep, setActiveStep] = useState(0);
   const [logEntries, setLogEntries] = useState<string[]>([]);
+  const addLogEntries = useCallback((entry: string) => {
+    setLogEntries((current) =>
+      [entry, ...current].slice(0, MAX_MACRO_LOG_ENTRIES),
+    );
+  }, []);
   const [targets, setTargets] = useState<MacroTarget[]>([]);
   const [targetCapabilities, setTargetCapabilities] = useState<string>("");
   const refreshingTargetsRef = useRef(false);
-  const [recordCursorMovement, setRecordCursorMovement] = useState(
-    settings.recordCursorMovement,
-  );
+  const recordCursorMovement = settings.recordCursorMovement;
   const [recordingSessionId, setRecordingSessionId] = useState<string | null>(
     null,
   );
@@ -269,12 +288,6 @@ export default function MacroPanel({
     profileId: activeProfile?.id,
     target: activeProfile?.target,
   });
-  macroDraftRef.current = {
-    source: draft,
-    name: draftName,
-    profileId: activeProfile?.id,
-    target: activeProfile?.target,
-  };
   const macroProfileId = activeProfile?.id;
   const macroTargetHwnd = activeProfile?.target?.hwnd ?? null;
   const macroTargetPid = activeProfile?.target?.pid ?? null;
@@ -291,16 +304,59 @@ export default function MacroPanel({
   const startingMacroRef = useRef(false);
   const startingRecordingRef = useRef(false);
   const runningRef = useRef(running);
-  runningRef.current = running;
   const pendingRecordingStartRef = useRef<Promise<string> | null>(null);
   const recordingSessionRef = useRef<string | null>(recordingSessionId);
-  recordingSessionRef.current = recordingSessionId;
+  const finalizeRecording = useCallback(
+    (result: RecordingResult) => {
+      const shouldLogResult =
+        lastStoppedSessionLoggedRef.current !== result.sessionId;
+      lastStoppedSessionLoggedRef.current = result.sessionId;
+      closedRecorderSessionRef.current = result.sessionId;
+      recordingSessionRef.current = null;
+      recordedEventsRef.current = result.events;
+      clearTimeoutRef(recordedEventsRenderTimerRef);
+      setRecordingSessionId(null);
+      setDraft(result.source);
+      setRecordedEvents(result.events);
+      setTimelinePage(null);
+      setValidation(null);
+      setRuntimeState("Idle");
+      setRecordingFinished(true);
+      setSelectedTimelineIndex(null);
+      if (shouldLogResult) {
+        addLogEntries(
+          "Recording captured " +
+            result.eventCount +
+            " events. Review before replay.",
+        );
+      }
+    },
+    [addLogEntries],
+  );
   const recordingContextRef = useRef({
     settings,
     update,
     profile: activeProfile,
   });
-  recordingContextRef.current = { settings, update, profile: activeProfile };
+  useLayoutEffect(() => {
+    macroDraftRef.current = {
+      source: draft,
+      name: draftName,
+      profileId: activeProfile?.id,
+      target: activeProfile?.target,
+    };
+    runningRef.current = running;
+    recordingSessionRef.current = recordingSessionId;
+    recordingContextRef.current = { settings, update, profile: activeProfile };
+  }, [
+    activeProfile,
+    draft,
+    draftName,
+    recordingSessionId,
+    running,
+    settings,
+    update,
+  ]);
   const timelinePageCount = Math.max(
     1,
     Math.ceil(recordedEvents.length / TIMELINE_PAGE_SIZE),
@@ -322,14 +378,12 @@ export default function MacroPanel({
   const recorderNoticeIsError = /could not|failed|conflict/i.test(
     recorderNotice,
   );
+  const hasCurrentValidation =
+    Boolean(draft.trim()) && validatedSource === draft && !validating;
   const editorErrors = useMemo(
-    () =>
-      validatedSource === draft && !validating
-        ? (validation?.errors ?? [])
-        : [],
-    [draft, validatedSource, validating, validation],
+    () => (hasCurrentValidation ? (validation?.errors ?? []) : []),
+    [hasCurrentValidation, validation],
   );
-  const hasCurrentValidation = validatedSource === draft && !validating;
   const validationPending = Boolean(draft.trim()) && !hasCurrentValidation;
   const runDiscardableAction = (action: () => void) => {
     if (!isDirty) {
@@ -364,28 +418,24 @@ export default function MacroPanel({
     return () => onDirtyChange(false);
   }, [isDirty, onDirtyChange]);
 
+  // Keep editor state aligned when the active profile changes through preset
+  // restore or external settings updates, not only through selectProfile().
+  /* eslint-disable react-hooks/set-state-in-effect */
   useEffect(() => {
     if (!activeProfile || draftId === activeProfile.id) return;
     clearTargetCapabilities();
     setDraftId(activeProfile.id);
     setDraft(activeProfile.source);
     setDraftName(activeProfile.name);
-    setValidation(null);
-    setValidatedSource(null);
   }, [activeProfile, clearTargetCapabilities, draftId]);
+  /* eslint-enable react-hooks/set-state-in-effect */
 
   useEffect(() => {
-    if (!draft.trim()) {
-      setValidation(null);
-      setValidatedSource(null);
-      setValidating(false);
-      return;
-    }
+    if (!draft.trim()) return;
     let cancelled = false;
-    setValidatedSource(null);
     const timer = window.setTimeout(() => {
       setValidating(true);
-      invoke<MacroValidation>("macro_validate", { source: draft })
+      validateSource(draft)
         .then((result) => {
           if (cancelled) return;
           setValidation(result);
@@ -414,13 +464,7 @@ export default function MacroPanel({
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [draft]);
-
-  useEffect(() => {
-    if (!recordingSessionId) {
-      setRecordCursorMovement(settings.recordCursorMovement);
-    }
-  }, [settings.recordCursorMovement, recordingSessionId]);
+  }, [draft, validateSource]);
 
   useEffect(() => {
     void syncMacroContext().catch((err) =>
@@ -464,19 +508,12 @@ export default function MacroPanel({
       "macro:step",
       (event) => {
         setActiveStep(event.step);
-        setLogEntries((current) =>
-          ["Step " + event.step + ": " + event.command, ...current].slice(
-            0,
-            100,
-          ),
-        );
+        addLogEntries("Step " + event.step + ": " + event.command);
       },
     );
     void addListener<{ message: string }>("macro:error", (event) => {
       setRuntimeState("Error");
-      setLogEntries((current) =>
-        ["Error: " + event.message, ...current].slice(0, 100),
-      );
+      addLogEntries("Error: " + event.message);
     });
     void addListener<{ sessionId: string; events: RecorderEvent[] }>(
       "recorder:events",
@@ -485,10 +522,7 @@ export default function MacroPanel({
         if (lastStoppedSessionLoggedRef.current === batch.sessionId) return;
         if (recordingSessionRef.current === null) {
           // The worker may flush its first batch before the state event arrives.
-          if (recordedEventsRenderTimerRef.current !== null) {
-            window.clearTimeout(recordedEventsRenderTimerRef.current);
-            recordedEventsRenderTimerRef.current = null;
-          }
+          clearTimeoutRef(recordedEventsRenderTimerRef);
           recordingSessionRef.current = batch.sessionId;
           recordedEventsRef.current = [];
           lastStoppedSessionLoggedRef.current = null;
@@ -511,7 +545,7 @@ export default function MacroPanel({
     );
     void addListener<string>("recorder:warning", (message) => {
       setRecorderNotice(message);
-      setLogEntries((current) => [message, ...current].slice(0, 100));
+      addLogEntries(message);
     });
     void addListener<{
       state: string;
@@ -533,10 +567,7 @@ export default function MacroPanel({
         recordingSessionRef.current = event.sessionId ?? "active";
         if (!sameSession) {
           closedRecorderSessionRef.current = null;
-          if (recordedEventsRenderTimerRef.current !== null) {
-            window.clearTimeout(recordedEventsRenderTimerRef.current);
-            recordedEventsRenderTimerRef.current = null;
-          }
+          clearTimeoutRef(recordedEventsRenderTimerRef);
           recordedEventsRef.current = [];
           lastStoppedSessionLoggedRef.current = null;
           setRecordedEvents([]);
@@ -562,12 +593,7 @@ export default function MacroPanel({
         );
       }
     });
-    void addListener<{
-      sessionId: string;
-      source: string;
-      eventCount: number;
-      events: RecorderEvent[];
-    }>("recorder:stopped", (event) => {
+    void addListener<RecordingResult>("recorder:stopped", (event) => {
       if (
         recordingSessionRef.current &&
         recordingSessionRef.current !== event.sessionId
@@ -580,39 +606,12 @@ export default function MacroPanel({
       ) {
         return;
       }
-      const shouldLogResult =
-        lastStoppedSessionLoggedRef.current !== event.sessionId;
-      lastStoppedSessionLoggedRef.current = event.sessionId;
-      closedRecorderSessionRef.current = event.sessionId;
-      recordingSessionRef.current = null;
-      recordedEventsRef.current = event.events;
-      if (recordedEventsRenderTimerRef.current !== null) {
-        window.clearTimeout(recordedEventsRenderTimerRef.current);
-        recordedEventsRenderTimerRef.current = null;
-      }
-      setRecordingSessionId(null);
-      setDraft(event.source);
-      setRecordedEvents(event.events);
-      setTimelinePage(null);
-      setValidation(null);
-      setRuntimeState("Idle");
-      setRecordingFinished(true);
-      setSelectedTimelineIndex(null);
-      if (shouldLogResult) {
-        setLogEntries((current) =>
-          [
-            "Recording captured " +
-              event.eventCount +
-              " events. Review before replay.",
-            ...current,
-          ].slice(0, 100),
-        );
-      }
+      finalizeRecording(event);
     });
     void addListener<string>("recorder:error", (message) => {
       setRecorderNotice(message);
       setRuntimeState("Error");
-      setLogEntries((current) => [message, ...current].slice(0, 100));
+      addLogEntries(message);
     });
     // Enable the global shortcut only once the panel can receive its events.
     void Promise.all(listenerRegistrations)
@@ -634,31 +633,16 @@ export default function MacroPanel({
         (err) =>
           console.error("Macro recorder panel state could not sync:", err),
       );
-      if (recordedEventsRenderTimerRef.current !== null) {
-        window.clearTimeout(recordedEventsRenderTimerRef.current);
-        recordedEventsRenderTimerRef.current = null;
-      }
+      clearTimeoutRef(recordedEventsRenderTimerRef);
     };
-  }, []);
-
-  useEffect(() => {
-    if (running && runtimeState !== "Recording")
-      setRuntimeState(paused ? "Paused" : "Running");
-    if (!running && (runtimeState === "Running" || runtimeState === "Paused")) {
-      setRuntimeState(
-        stopReason?.toLowerCase().includes("complete")
-          ? "Completed"
-          : "Cancelled",
-      );
-    }
-  }, [running, paused, stopReason, runtimeState]);
+  }, [addLogEntries, finalizeRecording]);
 
   useEffect(
     () => () => {
       const sessionId = recordingSessionRef.current;
       const pendingStart = pendingRecordingStartRef.current;
       const stopAndPersist = (id: string) =>
-        invoke<{ source: string }>("recorder_stop", { sessionId: id })
+        invoke<RecordingResult>("recorder_stop", { sessionId: id })
           .then(({ source }) => {
             const {
               settings: latestSettings,
@@ -682,13 +666,15 @@ export default function MacroPanel({
   const saveDraft = useCallback(
     (source = draft, name = draftName) => {
       if (!activeProfile) return;
-      updateProfile(settings, update, activeProfile, {
-        name: name.trim().slice(0, 80) || "New Macro",
-        source,
-        syntaxVersion: 1,
-        updatedAt: new Date().toISOString(),
+      update({
+        macroProfiles: withUpdatedProfile(settings, activeProfile, {
+          name: name.trim().slice(0, 80) || "New Macro",
+          source,
+          syntaxVersion: 1,
+          updatedAt: new Date().toISOString(),
+        }),
+        activeMacroId: activeProfile.id,
       });
-      update({ activeMacroId: activeProfile.id });
       setDraftId(activeProfile.id);
       setDraft(source);
       setDraftName(name.trim().slice(0, 80) || "New Macro");
@@ -700,14 +686,14 @@ export default function MacroPanel({
     setValidating(true);
     setRuntimeState("Validating");
     try {
-      const result = await invoke<MacroValidation>("macro_validate", {
-        source: draft,
-      });
+      const result = await validateSource(draft);
+      if (!macroPanelMountedRef.current) return null;
       setValidation(result);
       setValidatedSource(draft);
       setRuntimeState(result.ok ? "Idle" : "Error");
       return result;
     } catch (err) {
+      if (!macroPanelMountedRef.current) return null;
       setRuntimeState("Error");
       setValidation({
         ok: false,
@@ -717,9 +703,9 @@ export default function MacroPanel({
       setValidatedSource(draft);
       return null;
     } finally {
-      setValidating(false);
+      if (macroPanelMountedRef.current) setValidating(false);
     }
-  }, [draft]);
+  }, [draft, validateSource]);
 
   const selectProfile = (id: string) => {
     if (id === activeProfile?.id) return;
@@ -838,9 +824,7 @@ export default function MacroPanel({
       });
     } catch (err) {
       setRuntimeState("Error");
-      setLogEntries((current) =>
-        ["Import failed: " + String(err), ...current].slice(0, 100),
-      );
+      addLogEntries("Import failed: " + String(err));
     }
   };
 
@@ -854,9 +838,7 @@ export default function MacroPanel({
       if (path) await writeTextFile(path, draft);
     } catch (err) {
       setRuntimeState("Error");
-      setLogEntries((current) =>
-        ["Export failed: " + String(err), ...current].slice(0, 100),
-      );
+      addLogEntries("Export failed: " + String(err));
     }
   };
 
@@ -901,7 +883,9 @@ export default function MacroPanel({
 
   useEffect(() => {
     if (!settings.macroHotkeyOverride) return;
-    void refreshTargets();
+    const initialRefreshTimer = window.setTimeout(() => {
+      void refreshTargets();
+    }, 0);
     const refreshIfVisible = () => {
       if (document.visibilityState === "visible") void refreshTargets();
     };
@@ -909,6 +893,7 @@ export default function MacroPanel({
     window.addEventListener("focus", refreshIfVisible);
     document.addEventListener("visibilitychange", refreshIfVisible);
     return () => {
+      window.clearTimeout(initialRefreshTimer);
       window.clearInterval(interval);
       window.removeEventListener("focus", refreshIfVisible);
       document.removeEventListener("visibilitychange", refreshIfVisible);
@@ -982,25 +967,33 @@ export default function MacroPanel({
     } catch (err) {
       if (!macroPanelMountedRef.current) return;
       setPickCoordinateActive(false);
-      setLogEntries((current) =>
-        ["Coordinate picker failed: " + String(err), ...current].slice(0, 100),
-      );
+      addLogEntries("Coordinate picker failed: " + String(err));
     }
   };
 
   const macroExecutionLocked =
     Boolean(recordingSessionId) ||
     running ||
-    startingMacroRef.current ||
-    startingCountdownRef.current ||
+    startingMacro ||
+    preparingRecording ||
+    recordingCountdown !== null ||
     runtimeState === "Recording";
   const recorderBusy =
     Boolean(recordingSessionId) ||
     recordingCountdown !== null ||
-    startingCountdownRef.current ||
     preparingRecording ||
-    startingRecordingRef.current ||
     runtimeState === "Recording";
+  const displayedRuntimeState = running
+    ? runtimeState === "Recording"
+      ? runtimeState
+      : paused
+        ? "Paused"
+        : "Running"
+    : runtimeState === "Running" || runtimeState === "Paused"
+      ? stopReason?.toLowerCase().includes("complete")
+        ? "Completed"
+        : "Cancelled"
+      : runtimeState;
 
   const setMacroEnabled = (enabled: boolean) => {
     if (!enabled && recordingCountdown !== null) {
@@ -1091,10 +1084,7 @@ export default function MacroPanel({
     if (startingRecordingRef.current || recordingSessionRef.current) return;
     startingRecordingRef.current = true;
     let pendingStart: Promise<string> | null = null;
-    if (recordedEventsRenderTimerRef.current !== null) {
-      window.clearTimeout(recordedEventsRenderTimerRef.current);
-      recordedEventsRenderTimerRef.current = null;
-    }
+    clearTimeoutRef(recordedEventsRenderTimerRef);
     recordedEventsRef.current = [];
     setRecordedEvents([]);
     setRecorderNotice("");
@@ -1117,9 +1107,7 @@ export default function MacroPanel({
       if (!macroPanelMountedRef.current) return;
       setRecorderNotice("Recording could not start: " + String(err));
       setRuntimeState("Error");
-      setLogEntries((current) =>
-        ["Recording could not start: " + String(err), ...current].slice(0, 100),
-      );
+      addLogEntries("Recording could not start: " + String(err));
     } finally {
       if (pendingRecordingStartRef.current === pendingStart) {
         pendingRecordingStartRef.current = null;
@@ -1128,14 +1116,13 @@ export default function MacroPanel({
     }
   };
 
-  const cancelRecordingCountdown = () => {
-    if (recordingCountdownTimerRef.current !== null) {
-      window.clearInterval(recordingCountdownTimerRef.current);
-      recordingCountdownTimerRef.current = null;
-    }
+  const cancelRecordingCountdown = useCallback(() => {
+    clearTimeoutRef(recordingCountdownTimerRef);
     setRecordingCountdown(null);
-  };
-  cancelRecordingCountdownRef.current = cancelRecordingCountdown;
+  }, []);
+  useLayoutEffect(() => {
+    cancelRecordingCountdownRef.current = cancelRecordingCountdown;
+  }, [cancelRecordingCountdown]);
 
   const beginRecordingCountdown = async () => {
     if (
@@ -1175,26 +1162,29 @@ export default function MacroPanel({
 
       const endAt = Date.now() + seconds * 1000;
       setRecordingCountdown(seconds);
-      recordingCountdownTimerRef.current = window.setInterval(() => {
+      const updateCountdown = () => {
         const remaining = Math.max(0, Math.ceil((endAt - Date.now()) / 1000));
         if (remaining === 0) {
-          if (recordingCountdownTimerRef.current !== null) {
-            window.clearInterval(recordingCountdownTimerRef.current);
-            recordingCountdownTimerRef.current = null;
-          }
+          recordingCountdownTimerRef.current = null;
           setRecordingCountdown(null);
           void startRecording();
           return;
         }
         setRecordingCountdown(remaining);
-      }, 100);
+        const nextUpdateAt = endAt - (remaining - 1) * 1000;
+        recordingCountdownTimerRef.current = window.setTimeout(
+          updateCountdown,
+          Math.max(1, nextUpdateAt - Date.now()),
+        );
+      };
+      recordingCountdownTimerRef.current = window.setTimeout(
+        updateCountdown,
+        1000,
+      );
     } catch (err) {
       if (!macroPanelMountedRef.current) return;
-      setLogEntries((current) =>
-        [
-          "Could not stop Pick Point before recording: " + String(err),
-          ...current,
-        ].slice(0, 100),
+      addLogEntries(
+        "Could not stop Pick Point before recording: " + String(err),
       );
       setRecorderNotice(
         "Could not stop Pick Point before recording: " + String(err),
@@ -1207,10 +1197,7 @@ export default function MacroPanel({
 
   useEffect(
     () => () => {
-      if (recordingCountdownTimerRef.current !== null) {
-        window.clearInterval(recordingCountdownTimerRef.current);
-        recordingCountdownTimerRef.current = null;
-      }
+      clearTimeoutRef(recordingCountdownTimerRef);
     },
     [],
   );
@@ -1222,42 +1209,16 @@ export default function MacroPanel({
   const stopRecording = async () => {
     if (!recordingSessionId) return;
     try {
-      const result = await invoke<{
-        eventCount: number;
-        source: string;
-        events: RecorderEvent[];
-        sessionId: string;
-      }>("recorder_stop", { sessionId: recordingSessionId });
+      const result = await invoke<RecordingResult>("recorder_stop", {
+        sessionId: recordingSessionId,
+      });
       if (!macroPanelMountedRef.current) return;
-      const shouldLogResult =
-        lastStoppedSessionLoggedRef.current !== result.sessionId;
-      lastStoppedSessionLoggedRef.current = result.sessionId;
-      recordingSessionRef.current = null;
-      setRecordingSessionId(null);
-      setDraft(result.source);
-      setRecordedEvents(result.events);
-      setTimelinePage(null);
-      setRuntimeState("Idle");
-      setRecordingFinished(true);
-      setSelectedTimelineIndex(null);
-      setValidation(null);
-      if (shouldLogResult) {
-        setLogEntries((current) =>
-          [
-            "Recording captured " +
-              result.eventCount +
-              " events. Review before replay.",
-            ...current,
-          ].slice(0, 100),
-        );
-      }
+      finalizeRecording(result);
     } catch (err) {
       if (!macroPanelMountedRef.current) return;
       setRecorderNotice("Recording could not stop: " + String(err));
       setRuntimeState("Error");
-      setLogEntries((current) =>
-        ["Recording stop failed: " + String(err), ...current].slice(0, 100),
-      );
+      addLogEntries("Recording stop failed: " + String(err));
     }
   };
 
@@ -1322,32 +1283,19 @@ export default function MacroPanel({
       setValidation(null);
       setRuntimeState("Idle");
       setView("editor");
-      setLogEntries((current) =>
-        [
-          "Applied " +
-            recordedEvents.length +
-            " edited recording events to the editor.",
-          ...current,
-        ].slice(0, 100),
+      addLogEntries(
+        "Applied " +
+          recordedEvents.length +
+          " edited recording events to the editor.",
       );
     } catch (err) {
-      setLogEntries((current) =>
-        ["Could not convert edited timeline: " + String(err), ...current].slice(
-          0,
-          100,
-        ),
-      );
+      addLogEntries("Could not convert edited timeline: " + String(err));
     }
   };
 
   const startMacro = async () => {
     if (pickCoordinateActive) {
-      setLogEntries((current) =>
-        ["Turn Pick Point off before running a macro.", ...current].slice(
-          0,
-          100,
-        ),
-      );
+      addLogEntries("Turn Pick Point off before running a macro.");
       return;
     }
     if (
@@ -1362,6 +1310,7 @@ export default function MacroPanel({
     )
       return;
     startingMacroRef.current = true;
+    setStartingMacro(true);
     const sourceAtStart = draft;
     const nameAtStart = draftName;
     const profileIdAtStart = activeProfile.id;
@@ -1381,11 +1330,8 @@ export default function MacroPanel({
         latest.target?.pid !== targetAtStart?.pid
       ) {
         setRuntimeState("Idle");
-        setLogEntries((current) =>
-          [
-            "Macro changed during validation. Review it and run again.",
-            ...current,
-          ].slice(0, 100),
+        addLogEntries(
+          "Macro changed during validation. Review it and run again.",
         );
         return;
       }
@@ -1401,11 +1347,10 @@ export default function MacroPanel({
       setView("history");
     } catch (err) {
       setRuntimeState("Error");
-      setLogEntries((current) =>
-        ["Macro could not start: " + String(err), ...current].slice(0, 100),
-      );
+      addLogEntries("Macro could not start: " + String(err));
     } finally {
       startingMacroRef.current = false;
+      if (macroPanelMountedRef.current) setStartingMacro(false);
     }
   };
 
@@ -1791,7 +1736,6 @@ export default function MacroPanel({
                     disabled={!settings.macroHotkeyOverride || recorderBusy}
                     onChange={(mode) => {
                       const enabled = mode === "all-movement";
-                      setRecordCursorMovement(enabled);
                       update({ recordCursorMovement: enabled });
                     }}
                   />
@@ -1865,9 +1809,7 @@ export default function MacroPanel({
                   ) : (
                     <button
                       className="adv-secondary-btn macro-button macro-button-primary"
-                      disabled={
-                        running || startingMacroRef.current || recorderBusy
-                      }
+                      disabled={running || startingMacro || recorderBusy}
                       aria-busy={preparingRecording}
                       onClick={() => void beginRecordingCountdown()}
                     >
@@ -1883,7 +1825,7 @@ export default function MacroPanel({
                           ? "Countdown"
                           : preparingRecording
                             ? "Preparing"
-                            : runtimeState
+                            : displayedRuntimeState
                     }
                   >
                     {recordingSessionId
@@ -1892,7 +1834,7 @@ export default function MacroPanel({
                         ? "Starting in " + recordingCountdown + "s"
                         : preparingRecording
                           ? "Preparing recorder…"
-                          : runtimeState}
+                          : displayedRuntimeState}
                   </span>
                   <span>{recordedEvents.length} events</span>
                 </div>
@@ -2045,11 +1987,9 @@ export default function MacroPanel({
                   </div>
                   <span
                     className="macro-state-pill"
-                    data-state={
-                      paused ? "Paused" : running ? "Running" : runtimeState
-                    }
+                    data-state={displayedRuntimeState}
                   >
-                    {paused ? "Paused" : running ? "Running" : runtimeState}
+                    {displayedRuntimeState}
                   </span>
                 </div>
                 <div className="macro-run-controls">
@@ -2083,9 +2023,9 @@ export default function MacroPanel({
                       disabled={
                         Boolean(recordingSessionId) ||
                         recordingCountdown !== null ||
-                        startingRecordingRef.current ||
+                        preparingRecording ||
                         runtimeState === "Recording" ||
-                        startingMacroRef.current ||
+                        startingMacro ||
                         !activeProfile
                       }
                       onClick={() => void startMacro()}

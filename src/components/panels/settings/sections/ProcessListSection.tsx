@@ -1,7 +1,14 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { invoke } from "@tauri-apps/api/core";
 import type { Settings } from "../../../../store";
-import type { ProcessListEntry } from "../../../../settingsSchema";
 import { Disableable, CardDivider } from "../../advanced/sections/shared";
 import { SettingsCard } from "./shared";
 
@@ -17,6 +24,23 @@ interface Props {
   update: (patch: Partial<Settings>) => void;
 }
 
+const PROCESS_REFRESH_INTERVAL_MS = 5_000;
+
+function sameProcessSnapshot(left: ProcessInfo[], right: ProcessInfo[]) {
+  return (
+    left.length === right.length &&
+    left.every((process, index) => {
+      const next = right[index];
+      return (
+        process.name === next.name &&
+        process.displayName === next.displayName &&
+        process.pid === next.pid &&
+        process.iconBase64 === next.iconBase64
+      );
+    })
+  );
+}
+
 export default function ProcessListSection({ settings, update }: Props) {
   const [processes, setProcesses] = useState<ProcessInfo[]>([]);
   const [loading, setLoading] = useState(true);
@@ -24,6 +48,14 @@ export default function ProcessListSection({ settings, update }: Props) {
   const [listAtBottom, setListAtBottom] = useState(true);
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const listRef = useRef<HTMLDivElement>(null);
+  const mountedRef = useRef(false);
+  const refreshInFlightRef = useRef(false);
+  const refreshRequestIdRef = useRef(0);
+  const processListEntriesRef = useRef(settings.processListEntries);
+
+  useLayoutEffect(() => {
+    processListEntriesRef.current = settings.processListEntries;
+  }, [settings.processListEntries]);
 
   const updateListAtBottom = useCallback(() => {
     const el = listRef.current;
@@ -36,30 +68,53 @@ export default function ProcessListSection({ settings, update }: Props) {
   }, [updateListAtBottom]);
 
   const silentRefresh = useCallback(async () => {
+    if (
+      !mountedRef.current ||
+      document.visibilityState === "hidden" ||
+      refreshInFlightRef.current
+    ) {
+      return;
+    }
+    refreshInFlightRef.current = true;
+    const requestId = ++refreshRequestIdRef.current;
     try {
       const procs = await invoke<ProcessInfo[]>("list_processes");
-      setProcesses(procs);
+      if (mountedRef.current && requestId === refreshRequestIdRef.current) {
+        setProcesses((current) =>
+          sameProcessSnapshot(current, procs) ? current : procs,
+        );
+      }
     } catch {
-      //
+      // Keep the last snapshot; the next visible poll retries the request.
+    } finally {
+      if (requestId === refreshRequestIdRef.current) {
+        refreshInFlightRef.current = false;
+        if (mountedRef.current) setLoading(false);
+      }
     }
   }, []);
 
   useEffect(() => {
-    let mounted = true;
-    void (async () => {
-      try {
-        const procs = await invoke<ProcessInfo[]>("list_processes");
-        if (mounted) setProcesses(procs);
-      } catch {
-        //
-      } finally {
-        if (mounted) setLoading(false);
-      }
-    })();
-    intervalRef.current = setInterval(silentRefresh, 5000);
+    mountedRef.current = true;
+    const refreshWhenVisible = () => {
+      if (document.visibilityState === "visible") void silentRefresh();
+    };
+
+    const initialRefreshTimer = window.setTimeout(() => {
+      void silentRefresh();
+    }, 0);
+    intervalRef.current = setInterval(
+      silentRefresh,
+      PROCESS_REFRESH_INTERVAL_MS,
+    );
+    document.addEventListener("visibilitychange", refreshWhenVisible);
     return () => {
-      mounted = false;
+      mountedRef.current = false;
+      refreshRequestIdRef.current += 1;
+      refreshInFlightRef.current = false;
+      window.clearTimeout(initialRefreshTimer);
       if (intervalRef.current) clearInterval(intervalRef.current);
+      document.removeEventListener("visibilitychange", refreshWhenVisible);
     };
   }, [silentRefresh]);
 
@@ -67,34 +122,52 @@ export default function ProcessListSection({ settings, update }: Props) {
     updateListAtBottom();
   }, [processes, searchQuery, updateListAtBottom]);
 
-  const toggleEntry = (name: string, checked: boolean) => {
-    const withoutName = settings.processListEntries.filter(
-      (e) => e.name !== name,
-    );
-    const next = checked
-      ? [
-          ...withoutName,
-          {
-            name,
-            enabled: true,
-          } as ProcessListEntry,
-        ]
-      : withoutName;
-    update({ processListEntries: next });
-  };
-
-  const entryMap = new Map(settings.processListEntries.map((e) => [e.name, e]));
-  const matchesSearch = (p: ProcessInfo) =>
-    searchQuery.length < 1 ||
-    p.displayName.toLowerCase().includes(searchQuery.toLowerCase()) ||
-    p.name.toLowerCase().includes(searchQuery.toLowerCase());
-
-  const checkedProcesses = processes.filter(
-    (p) => entryMap.get(p.name)?.enabled && matchesSearch(p),
+  const toggleEntry = useCallback(
+    (name: string, checked: boolean) => {
+      const withoutName = processListEntriesRef.current.filter(
+        (e) => e.name !== name,
+      );
+      const next = checked
+        ? [
+            ...withoutName,
+            {
+              name,
+              enabled: true,
+            },
+          ]
+        : withoutName;
+      update({ processListEntries: next });
+    },
+    [update],
   );
-  const uncheckedProcesses = processes.filter(
-    (p) => !entryMap.get(p.name)?.enabled && matchesSearch(p),
+
+  const normalizedSearchQuery = searchQuery.toLowerCase();
+  const entryMap = useMemo(
+    () =>
+      new Map(
+        settings.processListEntries.map(
+          (entry) => [entry.name, entry] as const,
+        ),
+      ),
+    [settings.processListEntries],
   );
+  const { checkedProcesses, uncheckedProcesses } = useMemo(() => {
+    const checked: ProcessInfo[] = [];
+    const unchecked: ProcessInfo[] = [];
+
+    for (const process of processes) {
+      if (
+        normalizedSearchQuery &&
+        !process.displayName.toLowerCase().includes(normalizedSearchQuery) &&
+        !process.name.toLowerCase().includes(normalizedSearchQuery)
+      ) {
+        continue;
+      }
+      (entryMap.get(process.name)?.enabled ? checked : unchecked).push(process);
+    }
+
+    return { checkedProcesses: checked, uncheckedProcesses: unchecked };
+  }, [entryMap, normalizedSearchQuery, processes]);
 
   return (
     <SettingsCard
@@ -186,9 +259,7 @@ export default function ProcessListSection({ settings, update }: Props) {
             {loading ? (
               <div className="adv-click-points-empty">Refreshing...</div>
             ) : processes.length === 0 ? (
-              <div className="adv-click-points-empty">
-                No processes found. Click Refresh.
-              </div>
+              <div className="adv-click-points-empty">No processes found.</div>
             ) : searchQuery.length >= 1 &&
               checkedProcesses.length === 0 &&
               uncheckedProcesses.length === 0 ? (
@@ -204,7 +275,7 @@ export default function ProcessListSection({ settings, update }: Props) {
                   <ProcessRow
                     key={proc.name}
                     proc={proc}
-                    entry={entryMap.get(proc.name)!}
+                    checked
                     onToggleEntry={toggleEntry}
                   />
                 ))}
@@ -222,7 +293,7 @@ export default function ProcessListSection({ settings, update }: Props) {
                   <ProcessRow
                     key={proc.name}
                     proc={proc}
-                    entry={undefined}
+                    checked={false}
                     onToggleEntry={toggleEntry}
                   />
                 ))}
@@ -238,22 +309,21 @@ export default function ProcessListSection({ settings, update }: Props) {
   );
 }
 
-function ProcessRow({
+const ProcessRow = memo(function ProcessRow({
   proc,
-  entry,
+  checked,
   onToggleEntry,
 }: {
   proc: ProcessInfo;
-  entry: ProcessListEntry | undefined;
+  checked: boolean;
   onToggleEntry: (name: string, checked: boolean) => void;
 }) {
-  const isChecked = entry?.enabled ?? false;
   return (
     <label className="adv-click-points-item">
       <input
         type="checkbox"
         className="settings-proc-checkbox"
-        checked={isChecked}
+        checked={checked}
         onChange={(e) => onToggleEntry(proc.name, e.target.checked)}
       />
       {proc.iconBase64 ? (
@@ -263,4 +333,4 @@ function ProcessRow({
       <span className="settings-proc-exe">{proc.name}</span>
     </label>
   );
-}
+});

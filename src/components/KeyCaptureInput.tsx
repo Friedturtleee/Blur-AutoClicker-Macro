@@ -12,11 +12,14 @@ import {
   captureHotkey,
   captureModifierHotkey,
   formatHotkeyForDisplay,
-  getKeyboardLayoutMap,
   getMainKey,
   getStateClass,
   sortHeld,
 } from "../hotkeys";
+import {
+  useHotkeyCaptureSession,
+  useKeyboardLayoutMap,
+} from "./hotkeyCaptureHooks";
 import { isAlphabeticKeyboardKey } from "../keyboardKeyCase";
 import type { KeyboardKeyCase, MouseButton } from "../store";
 
@@ -55,8 +58,7 @@ export default function KeyCaptureInput({
 }: Props) {
   const [listening, setListening] = useState(false);
   const inputRef = useRef<HTMLButtonElement | null>(null);
-  const [layoutMap, setLayoutMap] =
-    useState<Awaited<ReturnType<typeof getKeyboardLayoutMap>>>(null);
+  const layoutMap = useKeyboardLayoutMap();
   const onChangeRef = useRef(onChange);
   const onMouseButtonCaptureRef = useRef(onMouseButtonCapture);
   const comboRef = useRef<string | null>(null);
@@ -67,39 +69,7 @@ export default function KeyCaptureInput({
     onMouseButtonCaptureRef.current = onMouseButtonCapture;
   });
 
-  useEffect(() => {
-    let active = true;
-    getKeyboardLayoutMap().then((map) => {
-      if (active) setLayoutMap(map);
-    });
-    return () => {
-      active = false;
-    };
-  }, []);
-
-  useEffect(() => {
-    if (!listening) return;
-
-    invoke("set_hotkey_capture_active", { active: true }).catch((err) => {
-      error(
-        JSON.stringify({
-          source: "KeyCaptureInput.toggle",
-          error: String(err),
-        }),
-      );
-    });
-
-    return () => {
-      invoke("set_hotkey_capture_active", { active: false }).catch((err) => {
-        error(
-          JSON.stringify({
-            source: "KeyCaptureInput.clear",
-            error: String(err),
-          }),
-        );
-      });
-    };
-  }, [listening]);
+  useHotkeyCaptureSession(listening, "KeyCaptureInput");
 
   const displayText = useMemo(() => {
     if (listening) return "Press a key\u2026";

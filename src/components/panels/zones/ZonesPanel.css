@@ -221,7 +221,7 @@
 }
 
 .adv-zone-index {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.75rem;
   font-weight: var(--font-weight-hv);
   color: var(--text-dim);
@@ -259,7 +259,7 @@
   background: transparent;
   color: var(--text-primary);
   cursor: pointer;
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-weight: var(--font-weight-hv);
   display: inline-flex;
   align-items: center;
@@ -367,25 +367,6 @@
   min-height: 0;
 }
 
-.adv-stop-zone-body {
-  display: flex;
-  flex-direction: column;
-  gap: 0.625rem;
-  align-items: stretch;
-  min-height: 0;
-  height: 100%;
-}
-
-.adv-stop-zone-controls {
-  display: flex;
-  flex-direction: column;
-  gap: 0.5rem;
-  min-width: 0;
-  flex: 1;
-  width: 100%;
-  min-height: 0;
-}
-
 .adv-stop-zone-list-shell {
   position: relative;
   width: 100%;
@@ -407,21 +388,6 @@
   box-sizing: border-box;
   scrollbar-gutter: stable;
   animation: adv-cplist-enable 0.01s 350ms forwards;
-}
-
-.adv-stop-zone-list::-webkit-scrollbar {
-  width: 0.375rem;
-  background: var(--bg-elevated);
-  border-radius: var(--radius-md);
-}
-
-.adv-stop-zone-list::-webkit-scrollbar-thumb {
-  background: var(--text-dim);
-  border-radius: var(--radius-sm);
-}
-
-.adv-stop-zone-list::-webkit-scrollbar-thumb:hover {
-  background: #777;
 }
 
 .adv-stop-zone-list > * + * {
@@ -446,14 +412,14 @@
 }
 
 .adv-zones-empty-title {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.8rem;
   font-weight: var(--font-weight-hv);
   color: var(--text-muted);
 }
 
 .adv-zones-empty-hint {
-  font-family: "RobotoFlex", sans-serif;
+  font-family: var(--font-family-base);
   font-size: 0.72rem;
   color: var(--text-dim);
   line-height: 1.4;
@@ -463,31 +429,4 @@
 .adv-zones-empty-hint strong {
   color: var(--text-primary);
   font-weight: var(--font-weight-hv);
-}
-
-.adv-proc-search {
-  font-family: "RobotoFlex", sans-serif;
-  font-size: 0.75rem;
-  height: var(--adv-control-height);
-  padding: 0 1.5rem 0 0.5rem;
-  margin-left: auto;
-  width: 12rem;
-  background-color: var(--bg-tertiary);
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Ccircle cx='5' cy='5' r='3.5' fill='none' stroke='%23999' stroke-width='1.2'/%3E%3Cline x1='7.75' y1='7.75' x2='10.5' y2='10.5' stroke='%23999' stroke-width='1.2' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 0.375rem center;
-  border: 0.0625rem solid var(--border-subtle);
-  border-radius: var(--radius-sm);
-  color: var(--text-main);
-  outline: none;
-  box-sizing: border-box;
-}
-
-.adv-proc-search::placeholder {
-  color: var(--text-dim);
-  opacity: 0.7;
-}
-
-.adv-proc-search:focus {
-  border-color: var(--accent);
 }

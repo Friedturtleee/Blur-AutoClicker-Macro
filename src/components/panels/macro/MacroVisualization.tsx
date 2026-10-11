@@ -20,6 +20,7 @@ interface Props {
 
 const ACTION_PAGE_SIZE = 50;
 const MAP_MARKER_LIMIT = 500;
+const MAP_TRAJECTORY_POINT_LIMIT = 1_200;
 
 function actionLabel(action: MacroVisualAction) {
   const coordinates =
@@ -152,6 +153,7 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
     let maxX = mapSpaceActions.length ? Number.NEGATIVE_INFINITY : 1;
     let minY = mapSpaceActions.length ? Number.POSITIVE_INFINITY : 0;
     let maxY = mapSpaceActions.length ? Number.NEGATIVE_INFINITY : 1;
+    let pathPointCount = 0;
     const includePoint = (x: number, y: number) => {
       minX = Math.min(minX, x);
       maxX = Math.max(maxX, x);
@@ -160,8 +162,11 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
     };
     mapSpaceActions.forEach((action) => {
       includePoint(action.x!, action.y!);
-      if (action.fromX !== undefined && action.fromY !== undefined)
+      pathPointCount += 1;
+      if (action.fromX !== undefined && action.fromY !== undefined) {
         includePoint(action.fromX, action.fromY);
+        if (action.kind === "move") pathPointCount += 1;
+      }
     });
     const spanX = maxX - minX;
     const spanY = maxY - minY;
@@ -178,18 +183,31 @@ const MacroVisualization = memo(function MacroVisualization({ source }: Props) {
       x: spanX === 0 ? 160 : offsetX + (x - minX) * mapRadiusScale,
       y: spanY === 0 ? 84 : offsetY + (y - minY) * mapRadiusScale,
     });
+    const pathPointStride = Math.max(
+      1,
+      Math.ceil(pathPointCount / MAP_TRAJECTORY_POINT_LIMIT),
+    );
     const pathCoordinates: string[] = [];
+    let pathPointIndex = 0;
+    const appendTrajectoryPoint = (x: number, y: number) => {
+      if (
+        pathPointIndex % pathPointStride === 0 ||
+        pathPointIndex === pathPointCount - 1
+      ) {
+        const point = plot(x, y);
+        pathCoordinates.push(`${point.x},${point.y}`);
+      }
+      pathPointIndex += 1;
+    };
     mapSpaceActions.forEach((action) => {
       if (
         action.kind === "move" &&
         action.fromX !== undefined &&
         action.fromY !== undefined
       ) {
-        const start = plot(action.fromX, action.fromY);
-        pathCoordinates.push(`${start.x},${start.y}`);
+        appendTrajectoryPoint(action.fromX, action.fromY);
       }
-      const end = plot(action.x!, action.y!);
-      pathCoordinates.push(`${end.x},${end.y}`);
+      appendTrajectoryPoint(action.x!, action.y!);
     });
     const trajectoryPoints = pathCoordinates.join(" ");
     return { plot, mapRadiusScale, trajectoryPoints };

@@ -75,6 +75,67 @@ const BACKEND_SETTINGS_SCHEMA_VERSION = 11;
 const MAX_DROPDOWN_OVERFLOW_BOTTOM = 220;
 const STATUS_BAR_HEIGHT = 26;
 
+// Keep this allowlist aligned with ClickerSettings in src-tauri/src/settings/mod.rs.
+// Frontend-only preferences and appearance assets should not cross the Tauri IPC.
+const BACKEND_SETTING_KEYS = [
+  "clickSpeed",
+  "clickInterval",
+  "inputType",
+  "keyboardKey",
+  "keyboardKeyCase",
+  "mouseButton",
+  "mode",
+  "dutyCycleMode",
+  "savedClickSpeed",
+  "savedClickInterval",
+  "dutyCycleEnabled",
+  "dutyCycle",
+  "speedRandomizationEnabled",
+  "speedRandomization",
+  "doubleClickEnabled",
+  "clickLimitEnabled",
+  "clickLimit",
+  "timeLimitEnabled",
+  "timeLimit",
+  "timeLimitUnit",
+  "cornerStopEnabled",
+  "cornerStopTL",
+  "cornerStopTR",
+  "cornerStopBL",
+  "cornerStopBR",
+  "edgeStopEnabled",
+  "edgeStopTop",
+  "edgeStopRight",
+  "edgeStopBottom",
+  "edgeStopLeft",
+  "clickPointsEnabled",
+  "stopZonesEnabled",
+  "stopWhenComplete",
+  "clickPoints",
+  "processListEnabled",
+  "processListMode",
+  "processListEntries",
+  "taskSwitcherStopEnabled",
+  "hotkey",
+  "recordingHotkey",
+  "macroRunHotkey",
+  "macroHotkeyOverride",
+  "emergencyStopHotkey",
+  "recordCursorMovement",
+  "rateInputMode",
+  "durationHours",
+  "durationMinutes",
+  "durationSeconds",
+  "durationMilliseconds",
+  "stopZones",
+  "disableScreenshots",
+  "advancedSettingsEnabled",
+  "lastPanel",
+  "showStopReason",
+  "showStopOverlay",
+  "strictHotkeyModifiers",
+] as const satisfies readonly (keyof Settings)[];
+
 type DropdownOverflowDetail = {
   active: boolean;
   bottom?: number;
@@ -140,12 +201,7 @@ async function syncSettingsToBackend(
   syncMacroContext = false,
 ) {
   const backendSettings = Object.fromEntries(
-    Object.entries(settings).filter(
-      ([key]) =>
-        key !== "macroProfiles" &&
-        key !== "activeMacroId" &&
-        key !== "macroMigrationVersion",
-    ),
+    BACKEND_SETTING_KEYS.map((key) => [key, settings[key]] as const),
   );
   await invoke("update_settings", {
     settings: {
@@ -281,6 +337,13 @@ export default function App() {
     scheduleSave(nextCommittedSettings);
   };
 
+  const persistSettingsPatch = (patch: Partial<Settings>) => {
+    persistCommittedSettings(
+      { ...committedSettingsRef.current, ...patch },
+      { ...uiSettingsRef.current, ...patch },
+    );
+  };
+
   const restoreLastValidHotkey = () => {
     const restoredHotkey = lastValidHotkeyRef.current;
     if (uiSettingsRef.current.hotkey === restoredHotkey) {
@@ -358,15 +421,24 @@ export default function App() {
   const updateSettings = useCallback((patch: Partial<Settings>) => {
     const { hotkey, ...rest } = patch;
 
-    if (Object.keys(rest).length > 0) {
-      const nextUiSettings = sanitizeSettings(
-        { ...uiSettingsRef.current, ...rest },
-        APP_VERSION,
-      );
+    const hasCommittedChanges = Object.entries(rest).some(
+      ([key, value]) =>
+        !Object.is(committedSettingsRef.current[key as keyof Settings], value),
+    );
+
+    if (hasCommittedChanges) {
       const nextCommittedSettings = sanitizeSettings(
         { ...committedSettingsRef.current, ...rest },
         APP_VERSION,
       );
+      // UI and committed settings only diverge while a hotkey candidate is
+      // waiting for registration. Reuse the sanitized snapshot instead of
+      // sanitizing large appearance assets and macro sources twice per update.
+      const pendingHotkey = uiSettingsRef.current.hotkey;
+      const nextUiSettings =
+        pendingHotkey === committedSettingsRef.current.hotkey
+          ? nextCommittedSettings
+          : { ...nextCommittedSettings, hotkey: pendingHotkey };
 
       persistCommittedSettingsRef.current(
         nextCommittedSettings,
@@ -460,20 +532,11 @@ export default function App() {
           },
         ]
       : committedSettingsRef.current.macroProfiles;
-    const nextCommittedSettings = {
-      ...committedSettingsRef.current,
+    persistSettingsPatch({
       presets: nextPresets,
       macroProfiles: nextMacroProfiles,
       activePresetId: preset.id,
-    };
-    const nextUiSettings = {
-      ...uiSettingsRef.current,
-      presets: nextPresets,
-      macroProfiles: nextMacroProfiles,
-      activePresetId: preset.id,
-    };
-
-    persistCommittedSettings(nextCommittedSettings, nextUiSettings);
+    });
     return true;
   };
 
@@ -564,20 +627,11 @@ export default function App() {
           ]
       : committedSettingsRef.current.macroProfiles;
 
-    const nextCommittedSettings = {
-      ...committedSettingsRef.current,
+    persistSettingsPatch({
       presets: nextPresets,
       macroProfiles: nextMacroProfiles,
       activePresetId: presetId,
-    };
-    const nextUiSettings = {
-      ...uiSettingsRef.current,
-      presets: nextPresets,
-      macroProfiles: nextMacroProfiles,
-      activePresetId: presetId,
-    };
-
-    persistCommittedSettings(nextCommittedSettings, nextUiSettings);
+    });
     return true;
   };
 
@@ -609,16 +663,9 @@ export default function App() {
       return false;
     }
 
-    const nextCommittedSettings = {
-      ...committedSettingsRef.current,
+    persistSettingsPatch({
       presets: nextPresets,
-    };
-    const nextUiSettings = {
-      ...uiSettingsRef.current,
-      presets: nextPresets,
-    };
-
-    persistCommittedSettings(nextCommittedSettings, nextUiSettings);
+    });
     return true;
   };
 
@@ -639,18 +686,10 @@ export default function App() {
         ? null
         : committedSettingsRef.current.activePresetId;
 
-    const nextCommittedSettings = {
-      ...committedSettingsRef.current,
+    persistSettingsPatch({
       presets: nextPresets,
       activePresetId: nextActivePresetId,
-    };
-    const nextUiSettings = {
-      ...uiSettingsRef.current,
-      presets: nextPresets,
-      activePresetId: nextActivePresetId,
-    };
-
-    persistCommittedSettings(nextCommittedSettings, nextUiSettings);
+    });
     return true;
   };
 
@@ -685,16 +724,9 @@ export default function App() {
     }
 
     const nextPresets = [...committedSettingsRef.current.presets, preset];
-    const nextCommittedSettings = {
-      ...committedSettingsRef.current,
+    persistSettingsPatch({
       presets: nextPresets,
-    };
-    const nextUiSettings = {
-      ...uiSettingsRef.current,
-      presets: nextPresets,
-    };
-
-    persistCommittedSettings(nextCommittedSettings, nextUiSettings);
+    });
     return true;
   };
 
@@ -782,16 +814,9 @@ export default function App() {
       };
 
       const nextPresets = [...committedSettingsRef.current.presets, preset];
-      const nextCommittedSettings = {
-        ...committedSettingsRef.current,
+      persistSettingsPatch({
         presets: nextPresets,
-      };
-      const nextUiSettings = {
-        ...uiSettingsRef.current,
-        presets: nextPresets,
-      };
-
-      persistCommittedSettings(nextCommittedSettings, nextUiSettings);
+      });
       return true;
     } catch {
       return null;
@@ -948,9 +973,9 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!settingsLoaded) return;
+    if (!settingsLoaded || tab === "click-points") return;
     invoke("macro_set_context", {
-      active: tab === "click-points",
+      active: settings.macroHotkeyOverride,
       source: activeMacro?.source ?? "",
       selectedHwnd: activeMacro?.target?.hwnd ?? null,
       selectedPid: activeMacro?.target?.pid ?? null,
@@ -960,6 +985,7 @@ export default function App() {
   }, [
     settingsLoaded,
     tab,
+    settings.macroHotkeyOverride,
     activeMacro?.id,
     activeMacro?.source,
     activeMacro?.target?.hwnd,
@@ -1242,19 +1268,47 @@ export default function App() {
     document.documentElement.dir = "ltr";
   }, []);
 
+  const appearanceSuffix = tabSuffix(tab);
+  const rawBackgroundImage = resolvePerPage(
+    settings,
+    settings.backgroundImage,
+    `backgroundImage${appearanceSuffix}`,
+  ) as string;
+  const appearancePanelOpacity =
+    resolvePerPage(
+      settings,
+      settings.panelOpacity,
+      `panelOpacity${appearanceSuffix}`,
+    ) / 100;
+  const appearanceWindowOpacity =
+    resolvePerPage(
+      settings,
+      settings.windowOpacity,
+      `windowOpacity${appearanceSuffix}`,
+    ) / 100;
+  const appearancePanelBlur = `${resolvePerPage(
+    settings,
+    settings.panelBlur,
+    `panelBlur${appearanceSuffix}`,
+  )}px`;
+  const appearanceBackgroundBlur = `${resolvePerPage(
+    settings,
+    settings.backgroundBlur,
+    `backgroundBlur${appearanceSuffix}`,
+  )}px`;
+  const appearanceBackgroundOpacity = resolvePerPage(
+    settings,
+    settings.backgroundOpacity,
+    `backgroundOpacity${appearanceSuffix}`,
+  );
+  const appearanceTheme = settings.theme;
+
   useLayoutEffect(() => {
     const root = document.querySelector(".app-root") as HTMLElement | null;
     if (!root) return;
 
-    const sfx = tabSuffix(tab);
-    const panelOpacity =
-      resolvePerPage(settings, settings.panelOpacity, `panelOpacity${sfx}`) /
-      100;
-    const windowOpacity =
-      resolvePerPage(settings, settings.windowOpacity, `windowOpacity${sfx}`) /
-      100;
     const colors =
-      settings.theme === "light"
+      appearanceTheme === "light"
         ? {
             base: "229, 223, 231",
             surface: "255, 255, 255",
@@ -1272,32 +1326,26 @@ export default function App() {
 
     root.style.setProperty(
       "--bg-base",
-      `rgba(${colors.base}, ${windowOpacity})`,
+      `rgba(${colors.base}, ${appearanceWindowOpacity})`,
     );
     root.style.setProperty(
       "--bg-surface",
-      `rgba(${colors.surface}, ${panelOpacity})`,
+      `rgba(${colors.surface}, ${appearancePanelOpacity})`,
     );
     root.style.setProperty(
       "--bg-elevated",
-      `rgba(${colors.elevated}, ${panelOpacity})`,
+      `rgba(${colors.elevated}, ${appearancePanelOpacity})`,
     );
     root.style.setProperty(
       "--bg-input",
-      `rgba(${colors.input}, ${panelOpacity})`,
+      `rgba(${colors.input}, ${appearancePanelOpacity})`,
     );
     root.style.setProperty(
       "--bg-input-off",
-      `rgba(${colors.inputOff}, ${panelOpacity})`,
+      `rgba(${colors.inputOff}, ${appearancePanelOpacity})`,
     );
-    root.style.setProperty(
-      "--bg-panel-blur",
-      `${resolvePerPage(settings, settings.panelBlur, `panelBlur${sfx}`)}px`,
-    );
-    root.style.setProperty(
-      "--bg-image-blur",
-      `${resolvePerPage(settings, settings.backgroundBlur, `backgroundBlur${sfx}`)}px`,
-    );
+    root.style.setProperty("--bg-panel-blur", appearancePanelBlur);
+    root.style.setProperty("--bg-image-blur", appearanceBackgroundBlur);
 
     return () => {
       root.style.removeProperty("--bg-base");
@@ -1309,34 +1357,11 @@ export default function App() {
       root.style.removeProperty("--bg-image-blur");
     };
   }, [
-    settings,
-    settings.windowOpacity,
-    settings.panelOpacity,
-    settings.panelBlur,
-    settings.backgroundBlur,
-    settings.theme,
-    settings.perPageAppearance,
-    settings.panelOpacitySimple,
-    settings.panelOpacityAdvanced,
-    settings.panelOpacityZones,
-    settings.panelOpacityClickPoints,
-    settings.panelOpacitySettings,
-    settings.panelBlurSimple,
-    settings.panelBlurAdvanced,
-    settings.panelBlurZones,
-    settings.panelBlurClickPoints,
-    settings.panelBlurSettings,
-    settings.backgroundBlurSimple,
-    settings.backgroundBlurAdvanced,
-    settings.backgroundBlurZones,
-    settings.backgroundBlurClickPoints,
-    settings.backgroundBlurSettings,
-    settings.windowOpacitySimple,
-    settings.windowOpacityAdvanced,
-    settings.windowOpacityZones,
-    settings.windowOpacityClickPoints,
-    settings.windowOpacitySettings,
-    tab,
+    appearanceBackgroundBlur,
+    appearancePanelBlur,
+    appearancePanelOpacity,
+    appearanceTheme,
+    appearanceWindowOpacity,
   ]);
 
   useEffect(() => {
@@ -1351,13 +1376,7 @@ export default function App() {
   }, []);
 
   const backgroundMedia = useMemo(() => {
-    const sfx = tabSuffix(tab);
-    const raw = resolvePerPage(
-      settings,
-      settings.backgroundImage,
-      `backgroundImage${sfx}`,
-    ) as string;
-    const trimmed = (raw ?? "").trim();
+    const trimmed = (rawBackgroundImage ?? "").trim();
     if (!trimmed)
       return { kind: "none" as const, cssUrl: null, videoSrc: null };
     let converted: string | null = null;
@@ -1386,17 +1405,7 @@ export default function App() {
       return { kind: "video" as const, cssUrl: null, videoSrc: resolved.src };
     }
     return { kind: "none" as const, cssUrl: null, videoSrc: null };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [
-    settings.backgroundImage,
-    settings.backgroundImageSimple,
-    settings.backgroundImageAdvanced,
-    settings.backgroundImageZones,
-    settings.backgroundImageClickPoints,
-    settings.backgroundImageSettings,
-    settings.perPageAppearance,
-    tab,
-  ]);
+  }, [rawBackgroundImage]);
 
   useLayoutEffect(() => {
     const root = document.querySelector(".app-root") as HTMLElement | null;
@@ -1406,30 +1415,8 @@ export default function App() {
     } else {
       root.style.setProperty("--bg-image", "none");
     }
-  }, [backgroundMedia]);
-
-  useLayoutEffect(() => {
-    const root = document.querySelector(".app-root") as HTMLElement | null;
-    if (!root) return;
-
-    const sfx = tabSuffix(tab);
-    const bgOp = resolvePerPage(
-      settings,
-      settings.backgroundOpacity,
-      `backgroundOpacity${sfx}`,
-    );
-    root.style.setProperty("--bg-opacity", String(bgOp));
-  }, [
-    settings,
-    settings.backgroundOpacity,
-    settings.perPageAppearance,
-    settings.backgroundOpacitySimple,
-    settings.backgroundOpacityAdvanced,
-    settings.backgroundOpacityZones,
-    settings.backgroundOpacityClickPoints,
-    settings.backgroundOpacitySettings,
-    tab,
-  ]);
+    root.style.setProperty("--bg-opacity", String(appearanceBackgroundOpacity));
+  }, [appearanceBackgroundOpacity, backgroundMedia]);
 
   const handleTabChange = useCallback(
     (nextTab: Tab) => {

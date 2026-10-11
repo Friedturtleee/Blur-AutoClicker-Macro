@@ -1,58 +1,24 @@
-import {
-  type CSSProperties,
-  type ChangeEvent,
-  type ReactNode,
-  type WheelEvent,
-} from "react";
+import { type CSSProperties, type ReactNode } from "react";
 import type { MouseButton, Settings } from "../../store";
 
-import CadenceInput from "../CadenceInput";
 import HotkeyCaptureInput from "../HotkeyCaptureInput";
 import { MODE_OPTIONS, SETTINGS_LIMITS } from "../../settingsSchema";
 import { isAlphabeticKeyboardKey } from "../../keyboardKeyCase";
 import { conflictsWithAutoPressKey } from "../../hotkeys";
 import KeyCaptureInput from "../KeyCaptureInput";
+import SimpleCadenceInput from "./SimpleCadenceInput";
+import {
+  dynamicChWidth,
+  handleNumberBlur,
+  handleNumberChange,
+  handleWheelStep,
+} from "../sharedCadence";
 import { AdvDropdown } from "./advanced/sections/shared";
 import "./SimplePanel.css";
 
 interface SimplePanelProps {
   settings: Settings;
   update: (patch: Partial<Settings>) => void;
-}
-
-function normalizeRaw(raw: string) {
-  return raw.replace(/^0+(?=\d)/, "");
-}
-
-function parseRawNumber(raw: string) {
-  const normalized = normalizeRaw(raw);
-  return normalized === "" ? 0 : Number(normalized);
-}
-
-function clamp(value: number, min: number, max: number) {
-  return Math.min(max, Math.max(min, value));
-}
-
-function dynamicChWidth(value: number, min = 1, max = 3) {
-  return `${clamp(String(value).length, min, max)}ch`;
-}
-
-function handleWheelStep(
-  event: WheelEvent<HTMLInputElement>,
-  current: number,
-  min: number,
-  max: number,
-  apply: (next: number) => void,
-) {
-  event.preventDefault();
-  event.stopPropagation();
-  event.currentTarget.blur();
-  const delta = event.deltaY < 0 ? 1 : -1;
-  let step = 1;
-  if (event.shiftKey && event.ctrlKey) step = 100;
-  else if (event.ctrlKey) step = 25;
-  else if (event.shiftKey) step = 5;
-  apply(clamp(current + delta * step, min, max));
 }
 
 function ControlBox({
@@ -105,20 +71,8 @@ function NumberField({
         value={value}
         min={min}
         max={max}
-        onChange={(event: ChangeEvent<HTMLInputElement>) => {
-          const normalized = normalizeRaw(event.target.value);
-          if (normalized !== event.target.value) {
-            event.target.value = normalized;
-          }
-          onChange(parseRawNumber(normalized));
-        }}
-        onBlur={(event) => {
-          const normalized = normalizeRaw(event.target.value);
-          if (normalized !== event.target.value) {
-            event.target.value = normalized;
-          }
-          onChange(clamp(parseRawNumber(normalized), min, max));
-        }}
+        onChange={(event) => handleNumberChange(event, onChange)}
+        onBlur={(event) => handleNumberBlur(event, min, max, onChange)}
         onWheel={(event) =>
           handleWheelStep(event, value, min, max, (next) => onChange(next))
         }
@@ -160,7 +114,7 @@ function SimplePanel({ settings, update }: SimplePanelProps) {
     <div className="vcontainer simple-panel">
       <div className="hcontainer simple-row simple-row--top">
         <div className="simple-row-item">
-          <CadenceInput settings={settings} update={update} variant="simple" />
+          <SimpleCadenceInput settings={settings} update={update} />
         </div>
 
         <ControlBox className="simple-hotkey-box simple-row-item">

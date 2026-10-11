@@ -4,20 +4,8 @@
   font-family: var(--font-family-base);
 }
 
-.macro-panel * {
-  font-family: var(--font-family-base);
-}
-
 .macro-editor-codemirror .cm-scroller {
   font-family: "Cascadia Mono", Consolas, monospace;
-}
-
-.macro-panel :where(button, input, textarea, select) {
-  font-family: var(--font-family-base);
-}
-
-.macro-panel .adv-toggle-btn {
-  font-family: var(--font-family-base);
 }
 
 .macro-main-card {
@@ -120,12 +108,14 @@
   min-width: 0;
 }
 
-.macro-toolbar {
+.macro-toolbar,
+.macro-run-controls {
   flex-wrap: wrap;
 }
 
 .macro-select {
   min-width: 8rem;
+  max-width: 12rem;
   flex: 1;
 }
 
@@ -137,7 +127,6 @@
   background: var(--bg-elevated);
   border: 1px solid var(--border-subtle);
   border-radius: var(--radius-sm);
-  font-family: var(--font-family-base);
   font-size: inherit;
   font-weight: var(--font-weight-md);
   letter-spacing: inherit;
@@ -256,10 +245,6 @@
 .macro-target-dropdown {
   flex: 1;
   min-width: 7rem;
-}
-
-.macro-select {
-  max-width: 12rem;
 }
 
 .macro-dropdown-menu {
@@ -943,38 +928,6 @@
   margin: 0;
 }
 
-.macro-panel,
-.macro-panel * {
-  scrollbar-color: color-mix(in srgb, var(--text-dim) 80%, transparent)
-    transparent;
-  scrollbar-width: thin;
-}
-
-.macro-panel::-webkit-scrollbar,
-.macro-panel *::-webkit-scrollbar {
-  width: 8px;
-  height: 8px;
-}
-
-.macro-panel::-webkit-scrollbar-track,
-.macro-panel *::-webkit-scrollbar-track {
-  background: transparent;
-}
-
-.macro-panel::-webkit-scrollbar-thumb,
-.macro-panel *::-webkit-scrollbar-thumb {
-  border: 2px solid transparent;
-  border-radius: 999px;
-  background: color-mix(in srgb, var(--text-dim) 78%, transparent);
-  background-clip: padding-box;
-}
-
-.macro-panel::-webkit-scrollbar-thumb:hover,
-.macro-panel *::-webkit-scrollbar-thumb:hover {
-  background: color-mix(in srgb, var(--accent) 75%, var(--text-dim));
-  background-clip: padding-box;
-}
-
 .macro-run-summary {
   display: flex;
   justify-content: space-between;
@@ -998,10 +951,6 @@
 .macro-run-summary > div > span {
   color: var(--text-dim);
   font-size: 0.68rem;
-}
-
-.macro-run-controls {
-  flex-wrap: wrap;
 }
 
 .macro-run-controls > span:last-child {

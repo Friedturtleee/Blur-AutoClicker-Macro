@@ -9,6 +9,7 @@ import {
   type ReactNode,
 } from "react";
 import type { Tab } from "../App";
+import { formatStopReason } from "../stopReason";
 
 import "./TitleBar.css";
 
@@ -57,38 +58,6 @@ const DEFAULT_TITLE_STATE: TitleViewState = {
   flipClass: "",
   isReason: false,
 };
-
-const STOP_REASON_TEXTS: Record<string, string> = {
-  "Stopped from UI": "Stopped",
-  "Stopped from toggle": "Stopped",
-  "Stopped from hotkey": "Stopped",
-  "Stopped from hold hotkey": "Stopped",
-  Stopped: "Stopped",
-  "Top-left corner failsafe": "Corner failsafe",
-  "Top-right corner failsafe": "Corner failsafe",
-  "Bottom-left corner failsafe": "Corner failsafe",
-  "Bottom-right corner failsafe": "Corner failsafe",
-  "Top edge failsafe": "Edge failsafe",
-  "Right edge failsafe": "Edge failsafe",
-  "Bottom edge failsafe": "Edge failsafe",
-  "Left edge failsafe": "Edge failsafe",
-  "Blocked by Alt+Tab": "Blocked by Alt+Tab",
-  "Blocked by process list": "Blocked by process list",
-};
-
-function translateStopReason(stopReason: string | null | undefined): string {
-  if (!stopReason) return "";
-  const staticText = STOP_REASON_TEXTS[stopReason];
-  if (staticText) return staticText;
-
-  const clickLimit = stopReason.match(/^Click limit reached \((.+)\)$/);
-  if (clickLimit) return "Click limit reached";
-
-  const timeLimit = stopReason.match(/^Time limit reached \((.+)\)$/);
-  if (timeLimit) return "Time limit reached";
-
-  return stopReason;
-}
 
 const SimpleIcon = memo(function SimpleIcon({ active }: TabIconProps) {
   return (
@@ -446,7 +415,7 @@ function AnimatedTitle({
 
     queueFrame(() => {
       setTitleState({
-        text: translateStopReason(stopReason),
+        text: formatStopReason(stopReason, true),
         isReason: true,
         flipClass: "squish-in",
       });

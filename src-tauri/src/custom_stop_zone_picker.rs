@@ -1,14 +1,12 @@
-use std::sync::{mpsc, Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, Emitter, Manager};
-use windows_sys::Win32::Foundation::{GetLastError, LPARAM, LRESULT, WPARAM};
-use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_ESCAPE;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CallNextHookEx, GetMessageW, PeekMessageW, PostThreadMessageW, SetWindowsHookExW,
-    UnhookWindowsHookEx, HHOOK, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT, WH_KEYBOARD_LL, WH_MOUSE_LL,
-    WM_KEYDOWN, WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
+    CallNextHookEx, PostThreadMessageW, HHOOK, KBDLLHOOKSTRUCT, MSLLHOOKSTRUCT, WM_KEYDOWN,
+    WM_MOUSEMOVE, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SYSKEYDOWN,
 };
 
 use crate::engine::mouse::{current_virtual_screen_rect, VirtualScreenRect};
@@ -132,82 +130,30 @@ pub fn start_custom_stop_zone_pick_inner(app: AppHandle) -> AppResult<()> {
         return Err(error);
     }
 
-    let (ready_tx, ready_rx) = mpsc::channel();
-    let hook_thread = std::thread::Builder::new()
-        .name("blur-stop-zone-picker".into())
-        .spawn(move || unsafe {
-            let mut initial_message = std::mem::zeroed::<MSG>();
-            // Create the queue before publishing the thread ID so cancellation can
-            // always post WM_QUIT, including while hooks are still starting.
-            PeekMessageW(&mut initial_message, std::ptr::null_mut(), 0, 0, 0);
-            let thread_id = GetCurrentThreadId();
-            let picker_reserved = {
-                let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-                if runtime.generation != generation || !runtime.active {
-                    false
-                } else {
-                    runtime.thread_id = thread_id;
-                    true
-                }
-            };
-            if !picker_reserved {
-                let _ = ready_tx.send(Err(AppError::State(
-                    "Stop-zone picker was cancelled during startup.".into(),
-                )));
-                return;
+    let hook_result = crate::picker_hook_thread::start_low_level_picker_hooks(
+        "blur-stop-zone-picker",
+        "Stop-zone picker",
+        Some(mouse_hook_proc),
+        Some(keyboard_hook_proc),
+        move |thread_id| {
+            let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+            if runtime.generation != generation || !runtime.active {
+                return false;
             }
-
-            let mouse_hook =
-                SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_hook_proc), std::ptr::null_mut(), 0);
-            if mouse_hook.is_null() {
-                let err = GetLastError();
-                clear_picker_thread_id(thread_id);
-                let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
-                return;
+            runtime.thread_id = thread_id;
+            true
+        },
+        move |thread_id, mouse_hook, keyboard_hook| {
+            let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
+            if runtime.generation != generation || !runtime.active {
+                return false;
             }
-
-            let keyboard_hook = SetWindowsHookExW(
-                WH_KEYBOARD_LL,
-                Some(keyboard_hook_proc),
-                std::ptr::null_mut(),
-                0,
-            );
-            if keyboard_hook.is_null() {
-                let err = GetLastError();
-                UnhookWindowsHookEx(mouse_hook);
-                clear_picker_thread_id(thread_id);
-                let _ = ready_tx.send(Err(AppError::WindowsSystem(err)));
-                return;
-            }
-
-            let picker_active = {
-                let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-                if runtime.generation != generation || !runtime.active {
-                    false
-                } else {
-                    runtime.mouse_hook = mouse_hook;
-                    runtime.keyboard_hook = keyboard_hook;
-                    runtime.thread_id = thread_id;
-                    true
-                }
-            };
-
-            if picker_active {
-                let _ = ready_tx.send(Ok(()));
-                let mut msg = std::mem::zeroed::<MSG>();
-                while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {}
-            } else {
-                UnhookWindowsHookEx(mouse_hook);
-                UnhookWindowsHookEx(keyboard_hook);
-                clear_picker_thread_id(thread_id);
-                let _ = ready_tx.send(Err(AppError::State(
-                    "Stop-zone picker was cancelled during startup.".into(),
-                )));
-                return;
-            }
-
-            UnhookWindowsHookEx(mouse_hook);
-            UnhookWindowsHookEx(keyboard_hook);
+            runtime.mouse_hook = mouse_hook;
+            runtime.keyboard_hook = keyboard_hook;
+            runtime.thread_id = thread_id;
+            true
+        },
+        move |thread_id, mouse_hook, keyboard_hook| {
             let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
             if runtime.mouse_hook == mouse_hook {
                 runtime.mouse_hook = std::ptr::null_mut();
@@ -215,28 +161,19 @@ pub fn start_custom_stop_zone_pick_inner(app: AppHandle) -> AppResult<()> {
             if runtime.keyboard_hook == keyboard_hook {
                 runtime.keyboard_hook = std::ptr::null_mut();
             }
-            if runtime.mouse_hook.is_null() && runtime.keyboard_hook.is_null() {
+            if runtime.thread_id == thread_id
+                && runtime.mouse_hook.is_null()
+                && runtime.keyboard_hook.is_null()
+            {
                 runtime.thread_id = 0;
             }
-        });
-    if let Err(error) = hook_thread {
-        stop_custom_stop_zone_pick(Some(app.clone()), true);
-        return Err(AppError::State(format!(
-            "Could not start stop-zone picker hooks: {error}"
-        )));
+        },
+    );
+    if let Err(error) = hook_result {
+        cancel_custom_stop_zone_pick_inner(&app);
+        return Err(error);
     }
-
-    match ready_rx.recv_timeout(Duration::from_secs(1)) {
-        Ok(Ok(())) => Ok(()),
-        Ok(Err(error)) => {
-            cancel_custom_stop_zone_pick_inner(&app);
-            Err(error)
-        }
-        Err(_) => {
-            cancel_custom_stop_zone_pick_inner(&app);
-            Err(AppError::ChannelFailure)
-        }
-    }
+    Ok(())
 }
 
 pub fn cancel_custom_stop_zone_pick_inner(app: &AppHandle) {
@@ -298,13 +235,6 @@ fn stop_custom_stop_zone_pick(
     }
 
     app
-}
-
-fn clear_picker_thread_id(thread_id: u32) {
-    let mut runtime = picker().lock().unwrap_or_else(poisoned_inner);
-    if runtime.thread_id == thread_id {
-        runtime.thread_id = 0;
-    }
 }
 
 unsafe extern "system" fn mouse_hook_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {

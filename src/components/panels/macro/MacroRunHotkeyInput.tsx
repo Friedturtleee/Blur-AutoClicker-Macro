@@ -1,5 +1,6 @@
 import { type FocusEvent, useEffect, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
+import { hotkeyIdentity } from "../../../hotkeys";
 import HotkeyCaptureInput from "../../HotkeyCaptureInput";
 
 interface HotkeyConflict {
@@ -12,46 +13,6 @@ interface Props {
   conflicts: HotkeyConflict[];
   disabled?: boolean;
   onChange: (value: string) => void;
-}
-
-const TOKEN_ALIASES: Record<string, string> = {
-  control: "ctrl",
-  option: "alt",
-  command: "super",
-  cmd: "super",
-  meta: "super",
-  win: "super",
-  lctrl: "leftctrl",
-  ctrlleft: "leftctrl",
-  rctrl: "rightctrl",
-  ctrlright: "rightctrl",
-  lalt: "leftalt",
-  altleft: "leftalt",
-  ralt: "rightalt",
-  altright: "rightalt",
-  altgr: "rightalt",
-  lshift: "leftshift",
-  shiftleft: "leftshift",
-  rshift: "rightshift",
-  shiftright: "rightshift",
-  lwin: "leftsuper",
-  leftwin: "leftsuper",
-  superleft: "leftsuper",
-  rwin: "rightsuper",
-  rightwin: "rightsuper",
-  superright: "rightsuper",
-};
-
-function hotkeyIdentity(value: string) {
-  return value
-    .split("+")
-    .map((token) => {
-      const normalized = token.trim().toLowerCase();
-      return TOKEN_ALIASES[normalized] ?? normalized;
-    })
-    .filter(Boolean)
-    .sort()
-    .join("+");
 }
 
 export default function MacroRunHotkeyInput({
